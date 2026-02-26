@@ -16,6 +16,74 @@
 
 ---
 
+## Build and Run
+
+### Prerequisites
+
+- [Android NDK](https://developer.android.com/ndk/downloads) (r25 or later; tested with r29)
+- `adb` in your `PATH` with the device connected
+
+### Configuration
+
+Set the following environment variables or pass them on the `make` command line:
+
+| Variable           | Default                  | Description                                      |
+|--------------------|--------------------------|--------------------------------------------------|
+| `NDK`              | `$ANDROID_NDK_HOME`      | Path to the unpacked Android NDK root            |
+| `API`              | `35`                     | Android API level to target                      |
+| `ARCH`             | `aarch64`                | Target CPU architecture                          |
+| `ADB`              | `adb`                    | ADB command (override to select a specific device, e.g. `adb -s <serial>`) |
+| `DESTDIR`          | `/data/local/tmp`        | On-device directory to push the binary           |
+
+The recommended way to point at a specific NDK installation is to export
+`ANDROID_NDK_HOME` once in your shell:
+
+```bash
+export ANDROID_NDK_HOME=/path/to/android-ndk-r29
+```
+
+To target a specific device, either set `ANDROID_SERIAL` (respected by `adb`
+automatically) or pass an explicit `ADB` override:
+
+```bash
+export ANDROID_SERIAL=192.168.0.2:40411   # adb uses this automatically
+# — or —
+make ADB="adb -s 192.168.0.2:40411" runprobe
+```
+
+### Build
+
+```bash
+make              # builds ./bwprobe for Android (aarch64, API 35 by default)
+```
+
+Override variables inline if needed:
+
+```bash
+make NDK=/opt/android-ndk-r29 API=34
+```
+
+### Run on device
+
+```bash
+make runprobe
+```
+
+This pushes `bwprobe` to `$DESTDIR` on the device, executes it, and writes:
+
+- `/tmp/bwprobe.csv` — raw per-sample CSV output (stdout from the binary)
+- `/tmp/bwprobe.log` — summary / human-readable log (stderr from the binary)
+
+The summary is printed to the terminal at the end of the run.
+
+### Clean
+
+```bash
+make clean        # removes the local bwprobe binary
+```
+
+---
+
 ## 1. The Problem: Two Distinct Contention Points
 
 Three processor types share both the LLCC and DRAM:
