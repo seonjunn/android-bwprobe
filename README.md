@@ -41,7 +41,7 @@ latency stratification, compute-vs-memory bottlenecks, and DRAM amplification so
 ## Build and Run
 
 ```bash
-make NDK=/home/seonjunkim/opt/android-ndk-r29         # build all binaries
+make NDK=/home/seonjunkim/opt/android-ndk-r29         # build all → build/
 make NDK=... ADB="adb -P 5307" runprobe               # → /tmp/bwprobe.csv
 make NDK=... ADB="adb -P 5307" runmatvec              # → /tmp/matvec.csv
 make NDK=... ADB="adb -P 5307" runllcc                # → /tmp/llcc_size.csv

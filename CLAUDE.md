@@ -16,8 +16,6 @@ src/               C source files
   matvec.c         Matrix-vector multiply, scalar vs explicit NEON (8-accumulator)
   prefault_exp.c   DRAM amplification isolation (baseline / MADV_DONTNEED / MADV_RANDOM)
   llcc_size.c      Effective LLCC capacity via flush-size sweep (24/128/256 MB)
-scripts/
-  thermstat        ADB-based thermal + freq monitor for Galaxy S25+
 analysis/
   plot_results.py  Post-processing and figure generation from CSV output
   figures/         Generated figures referenced by docs/slides.md
@@ -32,12 +30,12 @@ docs/
 # NDK is at /home/seonjunkim/opt/android-ndk-r29
 # Device ADB port: 5307
 
-make NDK=/home/seonjunkim/opt/android-ndk-r29                          # build all
+make NDK=/home/seonjunkim/opt/android-ndk-r29                         # build all → build/
 make NDK=... ADB="adb -P 5307" runprobe     # → /tmp/bwprobe.csv / .log
 make NDK=... ADB="adb -P 5307" runmatvec    # → /tmp/matvec.csv / .log
 make NDK=... ADB="adb -P 5307" runprefault  # → /tmp/prefault_exp.csv / .log
 make NDK=... ADB="adb -P 5307" runllcc      # → /tmp/llcc_size.csv / .log
-make clean
+make clean                                   # removes build/
 ```
 
 **Device prerequisites:** root, `perf_event_paranoid=-1`, tracefs at `/sys/kernel/debug/tracing`.
