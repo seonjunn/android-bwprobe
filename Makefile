@@ -11,16 +11,16 @@ DESTDIR ?= /data/local/tmp
 
 all: bwprobe matvec prefault_exp llcc_size
 
-bwprobe: bwprobe.c common.h
+bwprobe: src/bwprobe.c src/common.h
 	$(CC) $(CFLAGS) $< -o $@ -lm
 
-matvec: matvec.c common.h
+matvec: src/matvec.c src/common.h
 	$(CC) $(CFLAGS) $< -o $@ -lm
 
-prefault_exp: prefault_exp.c common.h
+prefault_exp: src/prefault_exp.c src/common.h
 	$(CC) $(CFLAGS) $< -o $@ -lm
 
-llcc_size: llcc_size.c common.h
+llcc_size: src/llcc_size.c src/common.h
 	$(CC) $(CFLAGS) $< -o $@ -lm
 
 clean:

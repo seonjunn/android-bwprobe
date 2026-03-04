@@ -56,7 +56,7 @@ Per rep: flush_caches(24 MB) → warmup (0.5 s) → chase_latency_ns (CNTVCT)
 
 ## bwprobe: Results
 
-![w:950](./analysis/figures/fig1_bwprobe_bw_lat.png)
+![w:950](../analysis/figures/fig1_bwprobe_bw_lat.png)
 
 - chase_GBs and lat_ns are the **reliable regime indicators** (bwmon noisy in cache regime)
 - Both show clean 2× transition at WS = 128 MB
@@ -80,7 +80,7 @@ Per rep: flush_caches(24 MB) → warmup (0.5 s) → chase_latency_ns (CNTVCT)
 
 ## PMU Calibration: bus_access
 
-![w:700](./analysis/figures/fig2_bwprobe_pmu.png)
+![w:700](../analysis/figures/fig2_bwprobe_pmu.png)
 
 - `bus_access × 64B / elapsed ≈ bwmon` at WS ≥ 128 MB: **ratio 1.034 ± 0.008**
 - In cache regime: `bus_access ≈ background` (~10–228 MB/s) — **correct signal** (no per-process DRAM)
@@ -125,7 +125,7 @@ Pointer-chase with flush ∈ {24, 128, 256} MB before each rep. `lat_ns` from CN
 
 ## matvec: Scalar vs NEON
 
-![w:1000](./analysis/figures/fig3_matvec.png)
+![w:1000](../analysis/figures/fig3_matvec.png)
 
 - M=4096 (y=16 KB L1D-resident); x ≤ 64 KB L1D-resident; **A is sole DRAM pressure**
 - Scalar: FMA-latency limited. NEON (8 accumulators): DRAM-bandwidth limited at WS=128 MB
