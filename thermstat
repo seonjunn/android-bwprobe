@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+
+set -e
+
+# -------- config --------
+SKIN_TEMP_MAX_C=36.0   # above this: too hot for fair benchmarks
+BAT_TEMP_MAX_C=45.0    # above this: battery too hot
+
+# enable freq checks only when temps exceed these
+SKIN_FREQ_CHECK_MIN_C=32.0
+BAT_FREQ_CHECK_MIN_C=38.0
+
+CPU_FREQ_MIN_RATIO=0.80
+GPU_FREQ_MIN_RATIO=0.80
+
+# paths on the Android device (read via adb shell)
+CPU_MAX_PATH="/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"
+CPU_CUR_PATH="/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
+GPU_MAX_PATH="/sys/class/kgsl/kgsl-3d0/max_gpuclk"
+GPU_CUR_PATH="/sys/class/kgsl/kgsl-3d0/gpuclk"
+
+# -------- helpers --------
+usage() {
+  cat <<EOF
+thermstat — Android thermal checker over ADB
+
+Usage:
+  thermstat [--freq] SKIN_ZONE BAT_ZONE
+  thermstat --zones
+  thermstat --zones-all
+  thermstat --help
+
+Core mode:
+  thermstat [--freq] SKIN_ZONE BAT_ZONE
+      SKIN_ZONE, BAT_ZONE are thermal_zone indices (numbers).
+
+      SKIN_ZONE:
+        A sensor representing device surface/board temperature.
+        Typical candidates have types containing:
+          "sys-therm", "skin".
+
+      BAT_ZONE:
+        A sensor representing battery temperature.
+        Type is usually:
+          "battery".
+
+      To identify these indices, run:
+        thermstat --zones    (filtered candidates)
+        thermstat --zones-all (full raw list)
+
+Temperature-only mode:
+      Without --freq:
+        Only SKIN/BAT temperatures are checked.
+        Purpose: detect if the device is thermally suitable for benchmarking.
+
+Temperature + frequency mode:
+      With --freq:
+        CPU/GPU current frequency is compared against their maximum.
+        Purpose: detect thermal throttling during high-load execution.
+
+      Note:
+        If CPU/GPU frequencies are manually locked to fixed values,
+        frequency-based throttling detection becomes meaningless.
+
+Zone listing:
+  thermstat --zones
+      Prints a filtered set of thermal zones that are most relevant
+      (skin/sys-therm/battery/soc/ap/gpu).  
+      Use this to quickly find SKIN_ZONE and BAT_ZONE candidates.
+
+  thermstat --zones-all
+      Prints all thermal_zoneN entries without filtering.
+      Use this only when the filtered list is insufficient.
+
+Examples:
+  thermstat 53 55
+  thermstat --freq 53 55
+  thermstat --zones
+
+
+EOF
+}
+
+print_zones_all() {
+  adb shell 'for d in /sys/class/thermal/thermal_zone*; do n=$(basename "$d" | sed "s/thermal_zone//"); t=$(cat "$d/type" 2>/dev/null); echo "thermal_zone${n}: ${t}"; done'
+}
+
+print_zones_filtered() {
+  # Show only "interesting" candidates: skin/sys-therm/battery
+  print_zones_all | grep -Ei 'skin|sys-therm|batt|battery' || true
+}
+
+# -------- adb checks --------
+if ! command -v adb >/dev/null 2>&1; then
+  echo "error: adb not found in PATH" >&2
+  exit 1
+fi
+
+if ! adb get-state 1>/dev/null 2>&1; then
+  echo "error: no adb device connected (or unauthorized)" >&2
+  exit 1
+fi
+
+# -------- arg parsing --------
+ENABLE_FREQ_CHECK=0
+
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+  usage
+  exit 0
+fi
+
+if [ "$1" = "--zones-all" ]; then
+  print_zones_all
+  exit 0
+fi
+
+if [ "$1" = "--zones" ]; then
+  print_zones_filtered
+  exit 0
+fi
+
+if [ "$1" = "--freq" ]; then
+  ENABLE_FREQ_CHECK=1
+  shift
+fi
+
+if [ $# -ne 2 ]; then
+  usage >&2
+  exit 1
+fi
+
+SKIN_ZONE="$1"
+BAT_ZONE="$2"
+
+# -------- core --------
+CPU_MAX=$(adb shell "cat ${CPU_MAX_PATH}" 2>/dev/null | tr -d '\r')
+GPU_MAX=$(adb shell "cat ${GPU_MAX_PATH}" 2>/dev/null | tr -d '\r')
+[ -z "$CPU_MAX" ] && CPU_MAX=0
+[ -z "$GPU_MAX" ] && GPU_MAX=0
+
+SKIN_RAW=$(adb shell "cat /sys/class/thermal/thermal_zone${SKIN_ZONE}/temp" 2>/dev/null | tr -d '\r')
+BAT_RAW=$(adb shell "cat /sys/class/thermal/thermal_zone${BAT_ZONE}/temp" 2>/dev/null | tr -d '\r')
+
+SKIN_TEMP_C=$(awk "BEGIN { printf \"%.1f\", $SKIN_RAW/1000 }")
+BAT_TEMP_C=$(awk "BEGIN { printf \"%.1f\", $BAT_RAW/1000 }")
+
+STATUS="NORMAL"
+
+# temperature-based decision
+if (( $(echo "$SKIN_TEMP_C >= $SKIN_TEMP_MAX_C" | bc -l) )); then STATUS="THROTTLED"; fi
+if (( $(echo "$BAT_TEMP_C  >= $BAT_TEMP_MAX_C"  | bc -l) )); then STATUS="THROTTLED"; fi
+
+CPU_RATIO="1.00"
+GPU_RATIO="1.00"
+
+if [ "$ENABLE_FREQ_CHECK" -eq 1 ]; then
+  if (( $(echo "$SKIN_TEMP_C >= $SKIN_FREQ_CHECK_MIN_C" | bc -l) )) || \
+     (( $(echo "$BAT_TEMP_C  >= $BAT_FREQ_CHECK_MIN_C"  | bc -l) )); then
+
+    CPU_CUR=$(adb shell "cat ${CPU_CUR_PATH}" 2>/dev/null | tr -d '\r')
+    GPU_CUR=$(adb shell "cat ${GPU_CUR_PATH}" 2>/dev/null | tr -d '\r')
+
+    CPU_RATIO=$(awk "BEGIN { if ($CPU_MAX>0) printf \"%.2f\", $CPU_CUR/$CPU_MAX; else print 1.0 }")
+    GPU_RATIO=$(awk "BEGIN { if ($GPU_MAX>0) printf \"%.2f\", $GPU_CUR/$GPU_MAX; else print 1.0 }")
+
+    if (( $(echo "$CPU_RATIO < $CPU_FREQ_MIN_RATIO" | bc -l) )); then STATUS="THROTTLED"; fi
+    if (( $(echo "$GPU_RATIO < $GPU_FREQ_MIN_RATIO" | bc -l) )); then STATUS="THROTTLED"; fi
+  fi
+fi
+
+echo "SKIN: ${SKIN_TEMP_C}°C (zone ${SKIN_ZONE}, max ${SKIN_TEMP_MAX_C}°C)"
+echo "BAT : ${BAT_TEMP_C}°C (zone ${BAT_ZONE}, max ${BAT_TEMP_MAX_C}°C)"
+if [ "$ENABLE_FREQ_CHECK" -eq 1 ]; then
+  echo "CPU_FREQ_RATIO=${CPU_RATIO} (min ${CPU_FREQ_MIN_RATIO})"
+  echo "GPU_FREQ_RATIO=${GPU_RATIO} (min ${GPU_FREQ_MIN_RATIO})"
+fi
+echo "STATUS: ${STATUS}"
+
+

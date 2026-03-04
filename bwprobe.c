@@ -13,9 +13,12 @@
  * Run   : make runprobe      (CSV → /tmp/bwprobe.csv, analysis → stderr)
  *
  * Output
- *   stdout — CSV with one row per working-set size:
- *              ws_MB, elapsed_s, bw_hwmon_MBs, [bw_<evt>_MBs, ratio_<evt>] ...
- *   stderr — human-readable sweep table and final conclusion
+ *   stdout — CSV with one row per (working-set size, rep):
+ *              ws_MB, rep, elapsed_s,
+ *              bw_hwmon_prime_MBs, bw_hwmon_gold_MBs,
+ *              hops, chase_GBs, lat_ns, skin_c,
+ *              [bw_<evt>_MBs, ratio_<evt>] ...
+ *   stderr — human-readable mean±stddev sweep table and final conclusion
  */
 
 #include "common.h"
@@ -28,10 +31,15 @@
 #define CPU_PIN          6       /* Oryon V2 Prime; bwmon-llcc-prime covers cpu6-7 */
 #define MEASURE_SECS     5.0
 #define WARMUP_SECS      0.5
+#define NREPS            7       /* independent trials per WS point */
+#define FLUSH_SIZE       (24 * 1024 * 1024)  /* > LLCC (12 MB) — evicts stale WS */
+#define LATENCY_HOPS     (1ULL << 20)        /* 1M hops via CNTVCT_EL0 */
 #define DRAM_WS_MIN_MB   128    /* WS >= this is confirmed DRAM-resident on Oryon V2 */
-                                /* 64 MB still partially cache-resident (bwmon ~30 MB/s) */
 #define TRACE_BASE       "/sys/kernel/debug/tracing"
 #define SYSFS_PMU        "/sys/bus/event_source/devices/armv8_pmuv3/events"
+
+/* Thermal — zone 53 = sys-therm-0 (skin/board surface) on Samsung Galaxy S25+ */
+#define SKIN_ZONE_PATH   "/sys/class/thermal/thermal_zone53/temp"
 
 /* --------------------------------------------------------------------------
  * Event table
@@ -39,36 +47,24 @@
  * Every event is opened with exclude_kernel=0.  On Qualcomm Oryon V2 this
  * is mandatory: cache refill operations are attributed to kernel context,
  * causing 23-33x undercounting with exclude_kernel=1.
- *
- * Fields:
- *   sysfs   — armv8_pmuv3/events/<sysfs> name to read actual config from;
- *             NULL means use PERF_TYPE_HARDWARE with the hardcoded config.
- *   csv     — column name emitted in the CSV header.
- *   type    — perf_event_attr.type value.
- *   config  — initial value; overwritten from sysfs at startup if available.
  * ------------------------------------------------------------------------- */
 #define PERF_TYPE_HW  1   /* PERF_TYPE_HARDWARE */
 #define ARMV8_PMU    10   /* confirmed via /sys/bus/event_source/devices/armv8_pmuv3/type */
 #define HW_CACHE_MISSES_ID 3  /* PERF_COUNT_HW_CACHE_MISSES */
 
 typedef struct {
-    /* identity */
     const char *label;
     const char *sysfs;
     const char *csv;
     uint32_t    type;
     uint64_t    config;
-    /* runtime */
     int         fd;
-    int         ok;           /* 1 = perf_event_open succeeds on this device */
-    /* accuracy stats accumulated over DRAM-regime WS points */
-    double      sum_ratio;    /* sum of (pmu_bw_est / hwmon_bw) */
-    int         n_dram;       /* number of valid DRAM-regime data points */
+    int         ok;
+    double      sum_ratio;
+    int         n_dram;
 } Evt;
 
 static Evt evts[] = {
-  /* Runtime fields (fd, ok, sum_ratio, n_dram) are zero-initialised here;
-   * fd is always overwritten inside measure_ws() before any use.            */
   { .label="l2d_cache",       .sysfs="l2d_cache",          .csv="l2d_cache",       .type=ARMV8_PMU,   .config=0x0016 },
   { .label="l2d_cache_refill",.sysfs="l2d_cache_refill",   .csv="l2d_refill",      .type=ARMV8_PMU,   .config=0x0017 },
   { .label="l1d_cache_refill",.sysfs="l1d_cache_refill",   .csv="l1d_refill",      .type=ARMV8_PMU,   .config=0x0003 },
@@ -82,15 +78,16 @@ static Evt evts[] = {
 /* --------------------------------------------------------------------------
  * Hardware DRAM monitor (bw_hwmon_meas) — background thread
  *
- * Enables the bw_hwmon_meas tracepoint and reads trace_pipe in non-blocking
- * mode, parsing lines from "bwmon-llcc-prime" (the Prime cluster, cpu6-7).
- * Accumulates MB/s samples so measure_ws() can take a before/after snapshot.
+ * Tracks both "bwmon-llcc-prime" (cpu6-7, Prime cluster) and
+ * "bwmon-llcc-gold" (cpu0-5, Gold cluster) simultaneously.
  * ------------------------------------------------------------------------- */
 typedef struct {
     volatile int    running;
     pthread_mutex_t lock;
-    double          sum;     /* sum of mbps samples seen */
-    long            n;       /* number of samples */
+    double          sum_prime;   /* MB/s accumulator — Prime cluster */
+    long            n_prime;
+    double          sum_gold;    /* MB/s accumulator — Gold cluster */
+    long            n_gold;
     int             available;
 } Hwmon;
 
@@ -98,7 +95,6 @@ static void *hwmon_thread(void *arg)
 {
     Hwmon *hw = arg;
 
-    /* Enable tracepoint */
     int fd = open(TRACE_BASE "/events/dcvs/bw_hwmon_meas/enable", O_WRONLY);
     if (fd < 0) { hw->available = 0; hw->running = 0; return NULL; }
     write(fd, "1", 1); close(fd);
@@ -121,16 +117,19 @@ static void *hwmon_thread(void *arg)
             if (c == '\n' || lp == (int)sizeof(line) - 2) {
                 line[lp] = '\0';
                 lp = 0;
-                if (strstr(line, "bw_hwmon_meas") &&
-                    strstr(line, "bwmon-llcc-prime")) {
-                    char *p = strstr(line, "mbps");
-                    if (p) {
-                        unsigned long long v = 0;
-                        if (sscanf(p, "mbps = %llu", &v) == 1) {
-                            pthread_mutex_lock(&hw->lock);
-                            hw->sum += (double)v;
-                            hw->n++;
-                            pthread_mutex_unlock(&hw->lock);
+                if (strstr(line, "bw_hwmon_meas")) {
+                    int is_prime = (strstr(line, "bwmon-llcc-prime") != NULL);
+                    int is_gold  = (strstr(line, "bwmon-llcc-gold")  != NULL);
+                    if (is_prime || is_gold) {
+                        char *p = strstr(line, "mbps");
+                        if (p) {
+                            unsigned long long v = 0;
+                            if (sscanf(p, "mbps = %llu", &v) == 1) {
+                                pthread_mutex_lock(&hw->lock);
+                                if (is_prime) { hw->sum_prime += (double)v; hw->n_prime++; }
+                                if (is_gold)  { hw->sum_gold  += (double)v; hw->n_gold++;  }
+                                pthread_mutex_unlock(&hw->lock);
+                            }
                         }
                     }
                 }
@@ -149,8 +148,6 @@ static void *hwmon_thread(void *arg)
 /* --------------------------------------------------------------------------
  * PMU helpers
  * ------------------------------------------------------------------------- */
-
-/* Load event config from sysfs (overrides hardcoded ARM spec fallback). */
 static void load_sysfs_configs(void)
 {
     for (int i = 0; i < N_EVTS; i++) {
@@ -181,62 +178,102 @@ static int open_evt(const Evt *e)
 }
 
 /* --------------------------------------------------------------------------
- * Measurement: one working-set size
+ * Thermal helper
  * ------------------------------------------------------------------------- */
-static void measure_ws(size_t ws, Hwmon *hw,
-                       uint64_t *counts,    /* [N_EVTS] out */
-                       double   *bw_hwmon,  /* MB/s average from hardware monitor */
-                       double   *elapsed,
-                       uint64_t *hops)
+static double read_skin_c(void)
+{
+    FILE *f = fopen(SKIN_ZONE_PATH, "r");
+    if (!f) return -1.0;
+    int raw = 0;
+    fscanf(f, "%d", &raw);
+    fclose(f);
+    return raw / 1000.0;
+}
+
+/* --------------------------------------------------------------------------
+ * Per-rep result
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    uint64_t counts[N_EVTS];
+    double   bw_hwmon_prime;
+    double   bw_hwmon_gold;
+    double   elapsed;
+    uint64_t hops;
+    double   lat_ns;      /* ns/hop from CNTVCT_EL0, fixed 1M hops */
+    double   skin_c;
+} BwResult;
+
+/* --------------------------------------------------------------------------
+ * Measurement: NREPS reps for one working-set size
+ *
+ * Per rep:
+ *   1. flush_caches(24 MB) — evict LLCC to establish clean starting state
+ *   2. warmup (run_chase for WARMUP_SECS) — re-load WS into LLCC
+ *   3. chase_latency_ns(1M hops) — per-hop latency via CNTVCT (no syscall)
+ *   4. hwmon snapshot before
+ *   5. PMU reset + enable; run_chase for MEASURE_SECS; PMU disable + read
+ *   6. hwmon snapshot after → compute prime + gold BW
+ * ------------------------------------------------------------------------- */
+static void measure_ws_multi(size_t ws, Hwmon *hw, BwResult res[NREPS])
 {
     uintptr_t *buf = build_chase(ws);
     if (!buf) { fprintf(stderr, "OOM at %zu MB\n", ws >> 20); return; }
     prefault(buf, ws);
 
-    /* Open counters for available events */
-    for (int i = 0; i < N_EVTS; i++) {
-        evts[i].fd = evts[i].ok ? open_evt(&evts[i]) : -1;
-    }
+    for (int r = 0; r < NREPS; r++) {
+        res[r].skin_c = read_skin_c();
 
-    /* Warm up — not measured */
-    run_chase(buf, WARMUP_SECS);
+        /* Evict LLCC, then warm up this WS */
+        flush_caches(FLUSH_SIZE);
+        run_chase(buf, WARMUP_SECS);
 
-    /* Snapshot hwmon before measurement */
-    pthread_mutex_lock(&hw->lock);
-    double s0 = hw->sum;  long n0 = hw->n;
-    pthread_mutex_unlock(&hw->lock);
+        /* Latency measurement — no PMU overhead, CNTVCT only */
+        res[r].lat_ns = chase_latency_ns(buf, LATENCY_HOPS);
 
-    /* Reset and start all counters atomically */
-    for (int i = 0; i < N_EVTS; i++) {
-        if (evts[i].fd < 0) continue;
-        ioctl(evts[i].fd, PERF_EVENT_IOC_RESET,  0);
-        ioctl(evts[i].fd, PERF_EVENT_IOC_ENABLE, 0);
-    }
+        /* Open PMU counters fresh each rep */
+        for (int i = 0; i < N_EVTS; i++)
+            evts[i].fd = evts[i].ok ? open_evt(&evts[i]) : -1;
 
-    double t0 = now_s();
-    *hops     = run_chase(buf, MEASURE_SECS);
-    *elapsed  = now_s() - t0;
+        /* hwmon snapshot before BW measurement */
+        pthread_mutex_lock(&hw->lock);
+        double s0p = hw->sum_prime; long n0p = hw->n_prime;
+        double s0g = hw->sum_gold;  long n0g = hw->n_gold;
+        pthread_mutex_unlock(&hw->lock);
 
-    for (int i = 0; i < N_EVTS; i++)
-        if (evts[i].fd >= 0) ioctl(evts[i].fd, PERF_EVENT_IOC_DISABLE, 0);
-
-    /* Read counts then close */
-    for (int i = 0; i < N_EVTS; i++) {
-        counts[i] = 0;
-        if (evts[i].fd >= 0) {
-            read(evts[i].fd, &counts[i], sizeof(counts[i]));
-            close(evts[i].fd);
-            evts[i].fd = -1;
+        /* Reset and start all PMU counters */
+        for (int i = 0; i < N_EVTS; i++) {
+            if (evts[i].fd < 0) continue;
+            ioctl(evts[i].fd, PERF_EVENT_IOC_RESET,  0);
+            ioctl(evts[i].fd, PERF_EVENT_IOC_ENABLE, 0);
         }
+
+        double t0      = now_s();
+        res[r].hops    = run_chase(buf, MEASURE_SECS);
+        res[r].elapsed = now_s() - t0;
+
+        for (int i = 0; i < N_EVTS; i++)
+            if (evts[i].fd >= 0) ioctl(evts[i].fd, PERF_EVENT_IOC_DISABLE, 0);
+
+        for (int i = 0; i < N_EVTS; i++) {
+            res[r].counts[i] = 0;
+            if (evts[i].fd >= 0) {
+                read(evts[i].fd, &res[r].counts[i], sizeof(res[r].counts[i]));
+                close(evts[i].fd);
+                evts[i].fd = -1;
+            }
+        }
+
+        /* hwmon snapshot after */
+        pthread_mutex_lock(&hw->lock);
+        double s1p = hw->sum_prime; long n1p = hw->n_prime;
+        double s1g = hw->sum_gold;  long n1g = hw->n_gold;
+        pthread_mutex_unlock(&hw->lock);
+
+        long nnp = n1p - n0p;
+        long nng = n1g - n0g;
+        res[r].bw_hwmon_prime = (nnp >= 3) ? (s1p - s0p) / (double)nnp : -1.0;
+        res[r].bw_hwmon_gold  = (nng >= 3) ? (s1g - s0g) / (double)nng : -1.0;
     }
-
-    /* hwmon average over the measurement window */
-    pthread_mutex_lock(&hw->lock);
-    double s1 = hw->sum;  long n1 = hw->n;
-    pthread_mutex_unlock(&hw->lock);
-
-    long nn = n1 - n0;
-    *bw_hwmon = (nn >= 3) ? (s1 - s0) / (double)nn : -1.0;
 
     free(buf);
 }
@@ -252,12 +289,11 @@ static void print_conclusion(int hwmon_ok)
         " CONCLUSION: Best CPU DRAM Measurement Method\n"
         "=================================================================\n\n");
 
-    /* Ground truth */
     if (hwmon_ok) {
         fprintf(stderr,
             "  [GROUND TRUTH]  bw_hwmon_meas tracepoint\n"
             "    Path   : /sys/kernel/debug/tracing/events/dcvs/bw_hwmon_meas\n"
-            "    Device : bwmon-llcc-prime  (CPU6-7 cluster)\n"
+            "    Devices: bwmon-llcc-prime (CPU6-7), bwmon-llcc-gold (CPU0-5)\n"
             "    Field  : mbps  (hardware-measured DRAM bandwidth)\n"
             "    Rate   : ~4 ms sampling, cluster-level only\n"
             "    Accuracy: hardware-exact — this IS the DRAM monitor\n\n");
@@ -265,7 +301,6 @@ static void print_conclusion(int hwmon_ok)
         fprintf(stderr, "  [GROUND TRUTH]  bw_hwmon_meas — NOT AVAILABLE on this device\n\n");
     }
 
-    /* Find best PMU event (closest mean ratio to 1.0 at DRAM WS) */
     int    best     = -1;
     double best_err = 1e9;
     for (int i = 0; i < N_EVTS; i++) {
@@ -275,8 +310,7 @@ static void print_conclusion(int hwmon_ok)
         if (err < best_err) { best_err = err; best = i; }
     }
 
-    /* Per-event accuracy table */
-    fprintf(stderr, "  PMU event accuracy at WS >= %d MB (vs bw_hwmon ground truth):\n\n",
+    fprintf(stderr, "  PMU event accuracy at WS >= %d MB (vs bw_hwmon_prime ground truth):\n\n",
             DRAM_WS_MIN_MB);
     fprintf(stderr, "  %-20s  %10s  %5s  %s\n",
             "Event", "mean ratio", "pts", "Verdict");
@@ -286,12 +320,12 @@ static void print_conclusion(int hwmon_ok)
     for (int i = 0; i < N_EVTS; i++) {
         if (!evts[i].ok) {
             fprintf(stderr, "  %-20s  %10s  %5s  not available on device\n",
-                    evts[i].label, "—", "—");
+                    evts[i].label, "-", "-");
             continue;
         }
         if (!hwmon_ok || evts[i].n_dram == 0) {
             fprintf(stderr, "  %-20s  %10s  %5s  no hwmon reference\n",
-                    evts[i].label, "—", "0");
+                    evts[i].label, "-", "0");
             continue;
         }
         double mean = evts[i].sum_ratio / evts[i].n_dram;
@@ -307,7 +341,6 @@ static void print_conclusion(int hwmon_ok)
                 verdict, (i == best) ? "  <-- BEST" : "");
     }
 
-    /* Best PMU event summary */
     if (best >= 0 && hwmon_ok) {
         double mean = evts[best].sum_ratio / evts[best].n_dram;
         fprintf(stderr,
@@ -332,8 +365,8 @@ static void print_conclusion(int hwmon_ok)
     fprintf(stderr,
         "\n"
         "  Decision guide:\n"
-        "    Need per-process attribution AND WS >> 24 MB → %s\n"
-        "    Any other case                               → bw_hwmon_meas.mbps\n"
+        "    Need per-process attribution AND WS >> 24 MB -> %s\n"
+        "    Any other case                               -> bw_hwmon_meas.mbps\n"
         "=================================================================\n",
         (best >= 0) ? evts[best].label : "(no PMU event accurate enough)");
 }
@@ -347,10 +380,11 @@ int main(void)
 
     fprintf(stderr,
         "=================================================================\n"
-        " bwprobe — CPU DRAM bandwidth measurement probe\n"
+        " bwprobe -- CPU DRAM bandwidth measurement probe\n"
         " Device : Snapdragon 8 Elite (Oryon V2), pinned to CPU%d\n"
+        " %d reps x %.1f s per WS; LLCC flush + CNTVCT latency each rep\n"
         "=================================================================\n\n",
-        CPU_PIN);
+        CPU_PIN, NREPS, MEASURE_SECS);
 
     /* Step 1: load configs from sysfs, fall back to hardcoded ARM spec values */
     load_sysfs_configs();
@@ -374,83 +408,116 @@ int main(void)
     fprintf(stderr, "\n");
 
     /* Step 3: start hardware DRAM monitor background thread */
-    Hwmon hw = { .running = 1, .sum = 0.0, .n = 0, .available = 0 };
+    Hwmon hw = { .running = 1,
+                 .sum_prime = 0.0, .n_prime = 0,
+                 .sum_gold  = 0.0, .n_gold  = 0,
+                 .available = 0 };
     pthread_mutex_init(&hw.lock, NULL);
     pthread_t tid;
     pthread_create(&tid, NULL, hwmon_thread, &hw);
     sleep(1);  /* allow first bw_hwmon_meas samples to arrive */
 
     if (hw.available)
-        fprintf(stderr, "[ bw_hwmon_meas tracepoint: ACTIVE (ground truth) ]\n\n");
+        fprintf(stderr, "[ bw_hwmon_meas tracepoint: ACTIVE (prime + gold) ]\n\n");
     else
-        fprintf(stderr, "[ bw_hwmon_meas tracepoint: NOT AVAILABLE — ratios will not be computed ]\n\n");
+        fprintf(stderr, "[ bw_hwmon_meas tracepoint: NOT AVAILABLE -- ratios will not be computed ]\n\n");
 
     /* Step 4: emit CSV header */
-    printf("ws_MB,elapsed_s,bw_hwmon_MBs");
+    printf("ws_MB,rep,elapsed_s,bw_hwmon_prime_MBs,bw_hwmon_gold_MBs,"
+           "hops,chase_GBs,lat_ns,skin_c");
     for (int i = 0; i < N_EVTS; i++)
         if (evts[i].ok)
             printf(",bw_%s_MBs,ratio_%s", evts[i].csv, evts[i].csv);
     printf("\n");
 
     /* Step 5: stderr sweep table header */
-    fprintf(stderr, "%-8s  %-12s", "WS(MB)", "hwmon(MB/s)");
+    fprintf(stderr, "%-8s  %-15s  %-13s  %-12s  %-8s",
+            "WS(MB)", "prime(MB/s)", "gold(MB/s)", "chase(GB/s)", "lat(ns)");
     for (int i = 0; i < N_EVTS; i++)
         if (evts[i].ok)
-            fprintf(stderr, "  %-24s", evts[i].label);
-    fprintf(stderr, "\n%-8s  %-12s", "--------", "------------");
+            fprintf(stderr, "  %-20s", evts[i].label);
+    fprintf(stderr, "\n%-8s  %-15s  %-13s  %-12s  %-8s",
+            "--------", "mean +/- sd", "mean +/- sd", "mean +/- sd", "mean");
     for (int i = 0; i < N_EVTS; i++)
         if (evts[i].ok)
-            fprintf(stderr, "  %-24s", "(est MB/s : ratio)");
+            fprintf(stderr, "  %-20s", "ratio (mean+/-sd)");
     fprintf(stderr, "\n");
 
     /* Step 6: working-set sweep */
-    static const size_t ws_mb[] = { 2, 4, 8, 16, 32, 64, 128, 256 };
-    static const int    n_ws    = 8;
+    static const size_t ws_mb[] = {
+        2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 256
+    };
+    static const int n_ws = 21;
 
     for (int w = 0; w < n_ws; w++) {
         size_t   ws = ws_mb[w] * 1024 * 1024;
-        uint64_t counts[N_EVTS];
-        double   bw_hwmon, elapsed;
-        uint64_t hops;
+        BwResult res[NREPS];
 
-        measure_ws(ws, &hw, counts, &bw_hwmon, &elapsed, &hops);
+        measure_ws_multi(ws, &hw, res);
 
-        /* CSV row */
-        printf("%zu,%.3f,%.1f", ws_mb[w], elapsed,
-               bw_hwmon > 0 ? bw_hwmon : -1.0);
-        for (int i = 0; i < N_EVTS; i++) {
-            if (!evts[i].ok) continue;
-            double bw    = (double)counts[i] * CACHE_LINE / elapsed / 1e6;
-            double ratio = (bw_hwmon > 0) ? bw / bw_hwmon : -1.0;
-            printf(",%.1f,%.4f", bw, ratio);
+        /* Emit CSV rows (one per rep) and accumulate DRAM-regime stats */
+        for (int r = 0; r < NREPS; r++) {
+            double chase_GBs = (double)res[r].hops * CACHE_LINE / res[r].elapsed / 1e9;
+            printf("%zu,%d,%.3f,%.1f,%.1f,%llu,%.3f,%.2f,%.1f",
+                   ws_mb[w], r + 1, res[r].elapsed,
+                   res[r].bw_hwmon_prime > 0 ? res[r].bw_hwmon_prime : -1.0,
+                   res[r].bw_hwmon_gold  > 0 ? res[r].bw_hwmon_gold  : -1.0,
+                   (unsigned long long)res[r].hops, chase_GBs,
+                   res[r].lat_ns, res[r].skin_c);
+            for (int i = 0; i < N_EVTS; i++) {
+                if (!evts[i].ok) continue;
+                double bw    = (double)res[r].counts[i] * CACHE_LINE / res[r].elapsed / 1e6;
+                double ratio = (res[r].bw_hwmon_prime > 0) ? bw / res[r].bw_hwmon_prime : -1.0;
+                printf(",%.1f,%.4f", bw, ratio);
+            }
+            printf("\n");
+
+            /* Accumulate DRAM-regime PMU calibration stats */
+            if (res[r].bw_hwmon_prime > 1000.0 && (int)ws_mb[w] >= DRAM_WS_MIN_MB) {
+                for (int i = 0; i < N_EVTS; i++) {
+                    if (!evts[i].ok) continue;
+                    double bw    = (double)res[r].counts[i] * CACHE_LINE / res[r].elapsed / 1e6;
+                    double ratio = bw / res[r].bw_hwmon_prime;
+                    evts[i].sum_ratio += ratio;
+                    evts[i].n_dram++;
+                }
+            }
         }
-        printf("\n");
         fflush(stdout);
 
-        /* Stderr row */
-        if (bw_hwmon > 0)
-            fprintf(stderr, "%-8zu  %-12.0f", ws_mb[w], bw_hwmon);
-        else
-            fprintf(stderr, "%-8zu  %-12s", ws_mb[w], "(no hwmon)");
+        /* Compute mean+/-stddev across reps for stderr summary */
+        double prime_v[NREPS], gold_v[NREPS], chase_v[NREPS], lat_v[NREPS];
+        for (int r = 0; r < NREPS; r++) {
+            prime_v[r] = res[r].bw_hwmon_prime > 0 ? res[r].bw_hwmon_prime : 0.0;
+            gold_v[r]  = res[r].bw_hwmon_gold  > 0 ? res[r].bw_hwmon_gold  : 0.0;
+            chase_v[r] = (double)res[r].hops * CACHE_LINE / res[r].elapsed / 1e9;
+            lat_v[r]   = res[r].lat_ns;
+        }
+        double pm = stat_mean(prime_v, NREPS), ps = stat_sd(prime_v, NREPS, pm);
+        double gm = stat_mean(gold_v,  NREPS), gs = stat_sd(gold_v,  NREPS, gm);
+        double cm = stat_mean(chase_v, NREPS), cs = stat_sd(chase_v, NREPS, cm);
+        double lm = stat_mean(lat_v,   NREPS);
+
+        char prime_str[24], gold_str[24], chase_str[24], lat_str[12];
+        snprintf(prime_str, sizeof(prime_str), "%.0f +/- %.0f", pm, ps);
+        snprintf(gold_str,  sizeof(gold_str),  "%.0f +/- %.0f", gm, gs);
+        snprintf(chase_str, sizeof(chase_str), "%.2f +/- %.2f", cm, cs);
+        snprintf(lat_str,   sizeof(lat_str),   "%.1f", lm);
+
+        fprintf(stderr, "%-8zu  %-15s  %-13s  %-12s  %-8s",
+                ws_mb[w], prime_str, gold_str, chase_str, lat_str);
 
         for (int i = 0; i < N_EVTS; i++) {
             if (!evts[i].ok) continue;
-            double bw    = (double)counts[i] * CACHE_LINE / elapsed / 1e6;
-            double ratio = (bw_hwmon > 0) ? bw / bw_hwmon : -1.0;
-            char cell[25];
-            if (bw_hwmon > 0)
-                snprintf(cell, sizeof(cell), "%.0f (%.2fx)", bw, ratio);
-            else
-                snprintf(cell, sizeof(cell), "%.0f MB/s", bw);
-            fprintf(stderr, "  %-24s", cell);
-
-            /* Accumulate stats only for confirmed DRAM-regime points:
-             * WS >= DRAM_WS_MIN_MB AND bw_hwmon shows real workload BW (>1 GB/s).
-             * Guards against background-only bwmon readings (~30 MB/s) at small WS. */
-            if (bw_hwmon > 1000.0 && (int)ws_mb[w] >= DRAM_WS_MIN_MB) {
-                evts[i].sum_ratio += ratio;
-                evts[i].n_dram++;
+            double rv[NREPS];
+            for (int r = 0; r < NREPS; r++) {
+                double bw = (double)res[r].counts[i] * CACHE_LINE / res[r].elapsed / 1e6;
+                rv[r] = (res[r].bw_hwmon_prime > 0) ? bw / res[r].bw_hwmon_prime : 0.0;
             }
+            double rm = stat_mean(rv, NREPS), rs = stat_sd(rv, NREPS, rm);
+            char cell[24];
+            snprintf(cell, sizeof(cell), "%.2fx +/- %.2f", rm, rs);
+            fprintf(stderr, "  %-20s", cell);
         }
         fprintf(stderr, "\n");
         fflush(stderr);
