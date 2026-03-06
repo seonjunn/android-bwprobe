@@ -7,8 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 C measurement tools for characterizing CPU DRAM/cache bandwidth on a Samsung Galaxy S25+
 (Snapdragon 8 Elite, Oryon V2). Cross-compiles for Android AArch64 via the Android NDK.
 
-**Goal:** Find a per-process metric for memory intensity (reads + writes) to estimate DRAM
-bandwidth contention a workload will cause or experience.
+**Goal:** Find a per-process metric for memory intensity (reads + writes) to estimate the
+contention a workload will cause or experience in the **shared memory subsystem** — LLCC
+and DRAM — where all processors (CPU clusters, GPU, DSP, display) compete. The metric must
+be sensitive to LLCC-resident workloads, not just DRAM-spilling ones.
 
 ## Repository Structure
 
@@ -122,8 +124,10 @@ CPU core (cpu6, Prime cluster)
 
 ## Key Empirical Findings
 
-**Metric selection for contention estimation:** Use `bus_access`. It fires at WS > 12 MB,
-counts reads + writes, and equals 1.93× bw_alg for all streaming workloads.
+**Metric selection for shared-subsystem contention:** Use `bus_access`. It fires at WS > 12 MB
+— i.e., whenever traffic enters the shared subsystem (LLCC or DRAM) — counts reads + writes,
+and equals 1.93× bw_alg for all streaming workloads. `bwmon` is insufficient: it only fires
+at WS > LLCC, missing LLCC-resident workloads that still compete for shared bandwidth.
 
 **LLCC absorption = 30.0% ± 0.1%** constant across all workloads and all WS ≥ 16 MB.
 `icc_dram = 0.70 × icc_llcc`. The two ICC metrics are sequential hops, not parallel paths —

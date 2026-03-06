@@ -18,6 +18,11 @@ CPU core (cpu6, Prime cluster)
 `bus_access` and `bwmon` measure at **different hierarchy levels**. The LLCC sits
 between them, absorbing ~30% of all L2 misses before they reach DRAM.
 
+The contention target is the **entire shared memory subsystem** (LLCC + DRAM), not DRAM
+alone. All processors (CPU clusters, GPU, DSP, display) share both the LLCC and the DRAM
+controller. A CPU workload with WS = 64 MB causes significant LLCC pressure (bus_access
+fires) even though bwmon ≈ 0. `bus_access` captures this; `bwmon` does not.
+
 ## 2. Metric Definitions
 
 | Metric | What it measures | Regime | Read/Write |
@@ -102,9 +107,10 @@ For workloads with writes, this ratio exceeds 1:
 | neon_matvec | 1.061 | ~1.0 | A is read-only streaming |
 | neon_axpy | **1.560** | **3/2 = 1.5** | 2 reads (x, y) + 1 write (y) |
 
-This is not a calibration error. For DRAM contention estimation, use `bus_access` (total
-DRAM occupancy) rather than `bwmon` (reads only). A read-only and read+write workload with
-the same `bwmon` cause different amounts of DRAM contention.
+This is not a calibration error. For shared-subsystem contention estimation, use
+`bus_access`: it captures total traffic entering the shared subsystem (reads + writes),
+fires at WS > L2 (covering LLCC-resident workloads), and equals bwmon × (reads+writes)/reads
+in the DRAM regime. `bwmon` (reads only, DRAM regime only) is insufficient for this purpose.
 
 ---
 

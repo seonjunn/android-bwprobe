@@ -1,7 +1,9 @@
 # Memory Bandwidth Characterization — Snapdragon 8 Elite (Oryon V2)
 
 **Goal:** Find a per-process metric that characterizes the *memory intensity* of a workload —
-reads and writes — to estimate the DRAM bandwidth contention it will cause or experience.
+reads and writes — to estimate the contention it will cause or experience in the **shared
+memory subsystem** (LLCC and DRAM), where all processors (CPU clusters, GPU, DSP, display)
+compete for the same bandwidth.
 
 Platform: Samsung Galaxy S25+, Snapdragon 8 Elite (SM8750), cpu6 (Prime cluster, 4.47 GHz).
 
@@ -33,15 +35,18 @@ Measurement points in the memory hierarchy:
 
 ## Key Findings
 
-**1. Metric regime boundaries.** `bus_access` measures at the L2 boundary (all L2 misses),
-`bwmon` at the DRAM controller. The LLCC sits between them and absorbs ~30% of L2 misses:
-- WS ≤ 12 MB (L2-resident): both metrics near zero
-- 12 MB < WS < LLCC: `bus_access` fires; `bwmon` ≈ 0
+**1. Metric regime boundaries.** `bus_access` measures at the L2 boundary (all L2 misses
+entering the shared subsystem), `bwmon` at the DRAM controller. The LLCC sits between them
+and absorbs ~30% of L2 misses:
+- WS ≤ 12 MB (L2-resident): both metrics near zero; no shared-resource pressure
+- 12 MB < WS < LLCC: `bus_access` fires (LLCC contention); `bwmon` ≈ 0
 - WS > LLCC: both fire; `bus_access / bwmon = (reads + writes) / reads`
 
-**2. `bus_access` captures reads AND writes; `bwmon` captures reads only.** For AXPY
-(2 reads + 1 write), `bus_access / bwmon = 3/2 = 1.5` — a principled difference, not error.
-For DRAM contention estimation, `bus_access` is the correct metric.
+**2. `bus_access` is the correct contention metric.** It fires at WS > 12 MB — i.e.,
+whenever traffic enters the shared subsystem (LLCC or DRAM). `bwmon` only fires at
+WS > LLCC, missing LLCC-resident workloads that still compete for shared capacity.
+`bus_access` also counts reads AND writes; for AXPY (2 reads + 1 write),
+`bus_access / bwmon = 3/2 = 1.5` — a principled difference, not error.
 
 **3. LLCC absorption is constant at 30%.** `(icc_llcc − icc_dram) / icc_llcc = 30.0% ± 0.1%`
 for all workloads at WS = 16–256 MB. This is temporal reuse within the workload, not just
@@ -68,14 +73,17 @@ for high-bandwidth write workloads (neon_axpy: 52% undercount vs total DRAM traf
 
 | Goal | Metric | Condition |
 |---|---|---|
-| **Contention estimation (universal)** | `bus_access` | WS > 12 MB (L2 boundary); reads + writes |
-| DRAM read bandwidth (ground truth) | `bwmon` | WS > 112 MB only |
-| Demand throughput (any WS) | `bw_alg` | Always; measures algorithm rate, not DRAM |
-| Real-time DRAM monitoring | `icc_dram_agg` | WS > LLCC; ~10% undercount (read-only) |
-| L2 + LLCC pressure | `icc_llcc_agg` | WS > 12 MB; ≈ `bus_access` |
+| **Shared-subsystem contention (universal)** | `bus_access` | WS > 12 MB; reads + writes; covers LLCC and DRAM |
+| DRAM read bandwidth (ground truth) | `bwmon` | WS > 112 MB only; misses LLCC-resident pressure |
+| Demand throughput (any WS) | `bw_alg` | Always; algorithm rate, independent of cache hierarchy |
+| Real-time DRAM monitoring | `icc_dram_agg` | WS > LLCC; ~10–25% undercount; read+write |
+| Total CPU→LLCC demand | `icc_llcc_agg` | WS > 12 MB; ≈ `bus_access`; includes LLCC hits |
 
 At DRAM regime: `bus_access = 1.93 × bw_alg` (streaming) and
 `bus_access = bwmon × (1 + write_streams / read_streams)`.
+
+`bwmon` is insufficient for contention estimation: a workload with WS = 64 MB causes
+significant LLCC pressure (`bus_access` fires) but shows `bwmon ≈ 0`.
 
 ---
 
