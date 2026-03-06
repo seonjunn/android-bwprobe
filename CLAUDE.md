@@ -1,6 +1,11 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to coding agents (Claude Code, Codex, and compatible tools) when
+working with code in this repository.
+
+Compatibility note:
+- `AGENTS.md` should be a symlink to this file so there is one canonical instruction source.
+- Ignore `note.txt` unless explicitly requested by the user.
 
 ## Overview
 
@@ -116,11 +121,24 @@ CPU core (cpu6, Prime cluster)
   LPDDR5X DRAM (128-bit bus)
 ```
 
-| WS range | bus_access | bwmon |
-|---|---|---|
-| ≤ 12 MB (L2-resident) | ≈ 0 | ≈ 0 |
-| 12–112 MB (LLCC-resident) | fires | ≈ 0 |
-| > 112 MB (DRAM regime) | fires | fires |
+**Measurement scope:** `bus_access` is **per-process** (perf_event on the current process).
+`bwmon` is **cluster-level** (all traffic from cpu6–7, including background system processes).
+At LLCC-resident WS for chase: bus_access=85 MB/s (workload) vs bwmon=315 MB/s (~230 MB/s
+background). bus_access isolates workload pressure; bwmon cannot at moderate BW levels.
+
+**Regime behavior is workload-dependent** — whether LLCC absorbs L2 misses depends on
+temporal reuse, not just WS vs LLCC capacity:
+
+| WS | bus_access | bwmon (cluster) | Notes |
+|---|---|---|---|
+| ≤ 12 MB (L2-resident) | ≈ 0 | ≈ background | No shared-subsystem pressure |
+| 12–112 MB, streaming | fires | fires | No temporal reuse → LLCC bypassed, DRAM hit |
+| 12–112 MB, random (chase) | fires (low) | ≈ background | LLCC absorbs most misses |
+| > 112 MB (DRAM regime) | fires | fires | bus/bwmon = (reads+writes)/reads |
+
+**DRAM onset per workload (bw_bench data):**
+- neon_matvec, neon_axpy, scalar_matvec: WS ≥ 16 MB → bwmon fires (streaming bypasses LLCC)
+- chase: WS ≥ 128 MB → bwmon fires (random access gets LLCC benefit up to ~64–112 MB WS)
 
 ## Key Empirical Findings
 
