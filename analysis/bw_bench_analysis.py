@@ -1,11 +1,14 @@
 """
 bw_bench_analysis.py — Analysis of controlled bandwidth benchmark results.
 
-Addresses four questions from the user:
+Sections:
   1. Experimental control: thermal gating effectiveness, warmup convergence
-  2. ICC undercounting theory: why icc_dram_agg < bwmon, when it is worst
-  3. ICC LLCC + DRAM additivity: why their sum does NOT equal bw_alg
-  4. Metric accuracy and workload characterisation across WS sweep
+  2. LLCC-resident regime: bus_access captures shared-subsystem pressure (bwmon blind)
+  3. Metric accuracy vs bwmon (DRAM regime, WS≥128 MB)
+  4. ICC undercounting: linear model, theory, per-workload fit
+  5. ICC LLCC + DRAM additivity: why their sum does NOT equal bw_alg
+  6. WS regime transitions: workload characterisation, bus_access universality
+  7. Summary table (WS=128 MB, DRAM regime)
 
 Usage: python3 analysis/bw_bench_analysis.py [--data data/] [--prefix bw_bench]
 """
@@ -74,7 +77,104 @@ for wl in WORKLOADS:
 # --------------------------------------------------------------------------
 print()
 print("=" * 70)
-print("§2  Metric Accuracy vs bwmon (DRAM regime, WS≥128 MB)")
+print("§2  bus_access vs bwmon: Regime Sensitivity and Measurement Scope")
+print("=" * 70)
+
+print("""
+Goal: shared-subsystem contention (LLCC + DRAM), not DRAM alone.
+All processors share both LLCC and DRAM. bus_access fires at WS > L2 (12 MB) —
+the moment traffic enters the shared subsystem — regardless of whether it hits
+in LLCC or goes to DRAM. bwmon only fires when data misses the LLCC entirely.
+
+Two regimes illustrate the gap:
+
+  L2-resident (WS ≤ 12 MB): no shared-subsystem pressure; both metrics ≈ 0.
+  LLCC-regime (WS > 12 MB):  bus_access fires; bwmon depends on access pattern:
+    - Random access (chase): good LLCC hit rate → bwmon ≈ background noise only
+    - Streaming (matvec, axpy): no temporal reuse → LLCC can't help → bwmon fires too
+
+In both LLCC-regime cases bus_access captures the shared-subsystem pressure.
+bwmon misses the random-access case entirely.
+""")
+
+ALL_WS = sorted(WS_LIST)
+
+print("  bus_access (MB/s) — fires at WS > 12 MB regardless of access pattern:")
+print(f"  {'workload':<18}", end="")
+for ws in ALL_WS:
+    print(f"  {ws:>5}MB", end="")
+print()
+for wl in WORKLOADS:
+    print(f"  {wl:<18}", end="")
+    for ws in ALL_WS:
+        sub = df[(df.workload == wl) & (df.ws_mb == ws)]
+        v = sub.bus_access_MBs.mean() if not sub.empty else float('nan')
+        print(f"  {v:>7.0f}", end="")
+    print()
+
+print(f"\n  bwmon (MB/s) — only fires when data misses LLCC (DRAM-regime):")
+print(f"  {'workload':<18}", end="")
+for ws in ALL_WS:
+    print(f"  {ws:>5}MB", end="")
+print()
+for wl in WORKLOADS:
+    print(f"  {wl:<18}", end="")
+    for ws in ALL_WS:
+        sub = df[(df.workload == wl) & (df.ws_mb == ws)]
+        v = sub.bwmon_MBs.mean() if not sub.empty else float('nan')
+        print(f"  {v:>7.0f}", end="")
+    print()
+
+print(f"\n  bus_access / bwmon ratio — >1 means bus_access sees traffic bwmon misses:")
+print(f"  {'workload':<18}", end="")
+for ws in ALL_WS:
+    print(f"  {ws:>5}MB", end="")
+print()
+for wl in WORKLOADS:
+    print(f"  {wl:<18}", end="")
+    for ws in ALL_WS:
+        sub = df[(df.workload == wl) & (df.ws_mb == ws)]
+        if sub.empty:
+            print(f"  {'—':>7}", end="")
+            continue
+        b = sub.bus_access_MBs.mean()
+        bw = sub.bwmon_MBs.mean()
+        if bw > 200 and b > 0:
+            print(f"  {b/bw:>7.2f}", end="")
+        else:
+            print(f"  {'—':>7}", end="")
+    print()
+
+print("""
+Interpretation:
+  WS=4 MB  : bus_access ≈ 0 for all workloads — L2-resident, no shared pressure.
+  WS=16 MB : bus_access fires for all workloads. bwmon also fires for streaming
+             (neon workloads: no LLCC reuse benefit despite WS < LLCC capacity).
+             chase: bus_access is low (LLCC absorbs most misses), bwmon ≈ background.
+  WS=128 MB: both fire — bus_access / bwmon = 1.0–1.6× depending on write traffic.
+
+  For streaming workloads, the "LLCC-resident" regime (bwmon≈0) does not exist in
+  practice: sequential access patterns have no temporal reuse, so LLCC provides no
+  buffering and data goes straight to DRAM even at small WS.
+
+  bus_access / bwmon > 1 even in the DRAM regime because:
+    (a) bus_access includes write traffic; bwmon counts reads only
+    (b) at intermediate WS, LLCC absorbs some L2 misses before they reach DRAM
+        → bus_access sees more traffic than bwmon
+
+  chase WS=64 MB: bus_access/bwmon = 0.27 (ratio < 1) — not a contradiction.
+    bwmon is CLUSTER-LEVEL (all traffic from cpu6-7, incl. background processes).
+    bus_access is PER-PROCESS (only this process's L2 misses).
+    bus_access=85 MB/s = chase workload is nearly LLCC-resident.
+    bwmon=315 MB/s = ~230 MB/s background system traffic dominates.
+    This is exactly the LLCC-resident case: the workload itself causes little DRAM
+    traffic, which bwmon can't isolate from background noise — bus_access can.
+""")
+
+# --------------------------------------------------------------------------
+print()
+print("=" * 70)
+print("§3  Metric Accuracy vs bwmon (DRAM regime, WS≥128 MB)")
 print("=" * 70)
 
 dram = df[df.is_dram & (df.ws_mb >= 128)].copy()
@@ -98,7 +198,7 @@ for col, label in [
 # --------------------------------------------------------------------------
 print()
 print("=" * 70)
-print("§3  ICC Undercounting: Linear Model & Theory")
+print("§4  ICC Undercounting: Linear Model & Theory")
 print("=" * 70)
 
 print("""
@@ -166,7 +266,7 @@ for wl in WORKLOADS:
 # --------------------------------------------------------------------------
 print()
 print("=" * 70)
-print("§4  icc_llcc + icc_dram vs bw_alg")
+print("§5  icc_llcc + icc_dram vs bw_alg")
 print("=" * 70)
 
 print("""
@@ -232,7 +332,7 @@ print("""
 # --------------------------------------------------------------------------
 print()
 print("=" * 70)
-print("§5  Workload Characterisation & WS Regime Transitions")
+print("§6  Workload Characterisation & WS Regime Transitions")
 print("=" * 70)
 
 print("\n  bwmon mean (MB/s) by workload and WS:")
@@ -282,7 +382,7 @@ for wl in WORKLOADS:
 # --------------------------------------------------------------------------
 print()
 print("=" * 70)
-print("§6  Summary Table (DRAM regime, WS=128 MB)")
+print("§7  Summary Table (DRAM regime, WS=128 MB)")
 print("=" * 70)
 
 sub128 = df[df.ws_mb == 128].copy()
