@@ -35,9 +35,18 @@
  * Run  : make ADB="adb -P 5307" runprefault
  */
 
-#include "common.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include "cpu.h"
+#include "timer.h"
+#include "cache.h"
+#include "chase.h"
+#include "hwmon.h"
+#include "matvec_kernels.h"
 
 #define CPU_PIN       6
 #define WS_MB         128
@@ -45,79 +54,6 @@
 #define MEASURE_SECS  3.0
 #define N_REPS        3
 #define FLUSH_SZ      (24  * 1024 * 1024)
-#define TRACE_BASE    "/sys/kernel/debug/tracing"
-
-/* -------------------------------------------------------------------------
- * bwmon thread (identical to matvec.c)
- * ---------------------------------------------------------------------- */
-typedef struct {
-    volatile int    running;
-    pthread_mutex_t lock;
-    double          sum;
-    long            n;
-    int             available;
-} Hwmon;
-
-static void *hwmon_thread(void *arg)
-{
-    Hwmon *hw = arg;
-    int fd = open(TRACE_BASE "/events/dcvs/bw_hwmon_meas/enable", O_WRONLY);
-    if (fd < 0) { hw->available = 0; hw->running = 0; return NULL; }
-    write(fd, "1", 1); close(fd);
-    fd = open(TRACE_BASE "/tracing_on", O_WRONLY);
-    if (fd >= 0) { write(fd, "1", 1); close(fd); }
-    hw->available = 1;
-    int pfd = open(TRACE_BASE "/trace_pipe", O_RDONLY | O_NONBLOCK);
-    if (pfd < 0) { hw->running = 0; return NULL; }
-    char raw[8192], line[512]; int lp = 0;
-    while (hw->running) {
-        ssize_t n = read(pfd, raw, sizeof(raw));
-        if (n <= 0) { usleep(2000); continue; }
-        for (ssize_t i = 0; i < n; i++) {
-            char c = raw[i];
-            if (c == '\n' || lp == (int)sizeof(line)-2) {
-                line[lp] = '\0'; lp = 0;
-                if (strstr(line,"bw_hwmon_meas") && strstr(line,"bwmon-llcc-prime")) {
-                    char *p = strstr(line,"mbps");
-                    if (p) { unsigned long long v=0;
-                        if (sscanf(p,"mbps = %llu",&v)==1) {
-                            pthread_mutex_lock(&hw->lock);
-                            hw->sum += (double)v; hw->n++;
-                            pthread_mutex_unlock(&hw->lock); } }
-                }
-            } else line[lp++] = c;
-        }
-    }
-    close(pfd);
-    fd = open(TRACE_BASE "/events/dcvs/bw_hwmon_meas/enable", O_WRONLY);
-    if (fd >= 0) { write(fd, "0", 1); close(fd); }
-    return NULL;
-}
-
-static void snap(Hwmon *hw, double *sum, long *n) {
-    pthread_mutex_lock(&hw->lock);
-    *sum = hw->sum; *n = hw->n;
-    pthread_mutex_unlock(&hw->lock);
-}
-static double bw_window(double s0, long n0, double s1, long n1) {
-    long dn = n1 - n0;
-    return (dn >= 2) ? (s1 - s0) / (double)dn : -1.0;
-}
-
-/* -------------------------------------------------------------------------
- * Scalar matvec kernel (same as matvec.c)
- * ---------------------------------------------------------------------- */
-__attribute__((noinline))
-static void matvec_scalar(const float * restrict A, const float * restrict x,
-                          float * restrict y, int M, int N)
-{
-    for (int i = 0; i < M; i++) {
-        const float *row = A + (size_t)i * N;
-        float s = 0.0f;
-        for (int j = 0; j < N; j++) s += row[j] * x[j];
-        y[i] = s;
-    }
-}
 
 /* -------------------------------------------------------------------------
  * One measurement variant
@@ -169,15 +105,15 @@ static void run_variant(Variant var, int M, int N, Hwmon *hw,
 
     /* ── Phase 1: flush ── */
     double s0, s1, s2, s3; long n0, n1, n2, n3;
-    snap(hw, &s0, &n0);
+    hwmon_snap(hw, &s0, &n0);
     flush_caches(FLUSH_SZ);
-    snap(hw, &s1, &n1);
-    double bwmon_flush = bw_window(s0, n0, s1, n1);
+    hwmon_snap(hw, &s1, &n1);
+    double bwmon_flush = hwmon_bw_window(s0, n0, s1, n1, 2);
 
     /* ── Phase 2: warmup ── */
     matvec_scalar(A, x, y, M, N);
-    snap(hw, &s2, &n2);
-    double bwmon_warmup = bw_window(s1, n1, s2, n2);
+    hwmon_snap(hw, &s2, &n2);
+    double bwmon_warmup = hwmon_bw_window(s1, n1, s2, n2, 2);
 
     /* ── Phase 3: measure ── */
     /* For MADV_RANDOM: apply AFTER warmup (warmup intentionally skips it
@@ -192,8 +128,8 @@ static void run_variant(Variant var, int M, int N, Hwmon *hw,
         passes++;
     }
     double elapsed = now_s() - t0;
-    snap(hw, &s3, &n3);
-    double bwmon_measure = bw_window(s2, n2, s3, n3);
+    hwmon_snap(hw, &s3, &n3);
+    double bwmon_measure = hwmon_bw_window(s2, n2, s3, n3, 2);
 
     double bw_matvec = (double)passes * (double)A_bytes / elapsed / 1e6;
     double amp = (bwmon_measure > 0) ? bwmon_measure / bw_matvec : -1.0;
@@ -246,8 +182,8 @@ int main(void)
     fprintf(stderr, " A bytes = %.0f MB\n\n", (double)A_bytes / 1048576);
 
     /* Start hwmon thread */
-    Hwmon hw = { .running=1, .sum=0.0, .n=0, .available=0 };
-    pthread_mutex_init(&hw.lock, NULL);
+    Hwmon hw;
+    hwmon_init(&hw, HWMON_PRIME);
     pthread_t tid;
     pthread_create(&tid, NULL, hwmon_thread, &hw);
     sleep(1);
@@ -278,6 +214,6 @@ int main(void)
 
     hw.running = 0;
     pthread_join(tid, NULL);
-    pthread_mutex_destroy(&hw.lock);
+    hwmon_destroy(&hw);
     return 0;
 }

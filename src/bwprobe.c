@@ -21,9 +21,23 @@
  *   stderr — human-readable mean±stddev sweep table and final conclusion
  */
 
-#include "common.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <math.h>
 #include <pthread.h>
+#include "cpu.h"
+#include "timer.h"
+#include "cache.h"
+#include "chase.h"
+#include "stats.h"
+#include "hwmon.h"
+#include "pmu.h"
+#include "thermal.h"
 
 /* --------------------------------------------------------------------------
  * Configuration
@@ -37,9 +51,6 @@
 #define DRAM_WS_MIN_MB   128    /* WS >= this is confirmed DRAM-resident on Oryon V2 */
 #define TRACE_BASE       "/sys/kernel/debug/tracing"
 #define SYSFS_PMU        "/sys/bus/event_source/devices/armv8_pmuv3/events"
-
-/* Thermal — zone 53 = sys-therm-0 (skin/board surface) on Samsung Galaxy S25+ */
-#define SKIN_ZONE_PATH   "/sys/class/thermal/thermal_zone53/temp"
 
 /* --------------------------------------------------------------------------
  * Event table
@@ -76,76 +87,6 @@ static Evt evts[] = {
 #define N_EVTS ((int)(sizeof(evts)/sizeof(evts[0])))
 
 /* --------------------------------------------------------------------------
- * Hardware DRAM monitor (bw_hwmon_meas) — background thread
- *
- * Tracks both "bwmon-llcc-prime" (cpu6-7, Prime cluster) and
- * "bwmon-llcc-gold" (cpu0-5, Gold cluster) simultaneously.
- * ------------------------------------------------------------------------- */
-typedef struct {
-    volatile int    running;
-    pthread_mutex_t lock;
-    double          sum_prime;   /* MB/s accumulator — Prime cluster */
-    long            n_prime;
-    double          sum_gold;    /* MB/s accumulator — Gold cluster */
-    long            n_gold;
-    int             available;
-} Hwmon;
-
-static void *hwmon_thread(void *arg)
-{
-    Hwmon *hw = arg;
-
-    int fd = open(TRACE_BASE "/events/dcvs/bw_hwmon_meas/enable", O_WRONLY);
-    if (fd < 0) { hw->available = 0; hw->running = 0; return NULL; }
-    write(fd, "1", 1); close(fd);
-    fd = open(TRACE_BASE "/tracing_on", O_WRONLY);
-    if (fd >= 0) { write(fd, "1", 1); close(fd); }
-
-    hw->available = 1;
-
-    int pfd = open(TRACE_BASE "/trace_pipe", O_RDONLY | O_NONBLOCK);
-    if (pfd < 0) { hw->running = 0; return NULL; }
-
-    char raw[8192], line[512];
-    int lp = 0;
-
-    while (hw->running) {
-        ssize_t n = read(pfd, raw, sizeof(raw));
-        if (n <= 0) { usleep(2000); continue; }
-        for (ssize_t i = 0; i < n; i++) {
-            char c = raw[i];
-            if (c == '\n' || lp == (int)sizeof(line) - 2) {
-                line[lp] = '\0';
-                lp = 0;
-                if (strstr(line, "bw_hwmon_meas")) {
-                    int is_prime = (strstr(line, "bwmon-llcc-prime") != NULL);
-                    int is_gold  = (strstr(line, "bwmon-llcc-gold")  != NULL);
-                    if (is_prime || is_gold) {
-                        char *p = strstr(line, "mbps");
-                        if (p) {
-                            unsigned long long v = 0;
-                            if (sscanf(p, "mbps = %llu", &v) == 1) {
-                                pthread_mutex_lock(&hw->lock);
-                                if (is_prime) { hw->sum_prime += (double)v; hw->n_prime++; }
-                                if (is_gold)  { hw->sum_gold  += (double)v; hw->n_gold++;  }
-                                pthread_mutex_unlock(&hw->lock);
-                            }
-                        }
-                    }
-                }
-            } else {
-                line[lp++] = c;
-            }
-        }
-    }
-
-    close(pfd);
-    fd = open(TRACE_BASE "/events/dcvs/bw_hwmon_meas/enable", O_WRONLY);
-    if (fd >= 0) { write(fd, "0", 1); close(fd); }
-    return NULL;
-}
-
-/* --------------------------------------------------------------------------
  * PMU helpers
  * ------------------------------------------------------------------------- */
 static void load_sysfs_configs(void)
@@ -166,28 +107,7 @@ static void load_sysfs_configs(void)
 
 static int open_evt(const Evt *e)
 {
-    struct perf_event_attr a;
-    memset(&a, 0, sizeof(a));
-    a.type           = e->type;
-    a.config         = e->config;
-    a.size           = sizeof(a);
-    a.disabled       = 1;
-    a.exclude_kernel = 0;  /* MANDATORY on Oryon V2 */
-    a.exclude_hv     = 1;
-    return (int)perf_event_open(&a, 0, -1, -1, 0);
-}
-
-/* --------------------------------------------------------------------------
- * Thermal helper
- * ------------------------------------------------------------------------- */
-static double read_skin_c(void)
-{
-    FILE *f = fopen(SKIN_ZONE_PATH, "r");
-    if (!f) return -1.0;
-    int raw = 0;
-    fscanf(f, "%d", &raw);
-    fclose(f);
-    return raw / 1000.0;
+    return open_evt_raw(e->type, e->config);
 }
 
 /* --------------------------------------------------------------------------
@@ -235,10 +155,8 @@ static void measure_ws_multi(size_t ws, Hwmon *hw, BwResult res[NREPS])
             evts[i].fd = evts[i].ok ? open_evt(&evts[i]) : -1;
 
         /* hwmon snapshot before BW measurement */
-        pthread_mutex_lock(&hw->lock);
-        double s0p = hw->sum_prime; long n0p = hw->n_prime;
-        double s0g = hw->sum_gold;  long n0g = hw->n_gold;
-        pthread_mutex_unlock(&hw->lock);
+        double s0p, s0g; long n0p, n0g;
+        hwmon_snap_full(hw, &s0p, &n0p, &s0g, &n0g, NULL, NULL, NULL, NULL);
 
         /* Reset and start all PMU counters */
         for (int i = 0; i < N_EVTS; i++) {
@@ -264,15 +182,11 @@ static void measure_ws_multi(size_t ws, Hwmon *hw, BwResult res[NREPS])
         }
 
         /* hwmon snapshot after */
-        pthread_mutex_lock(&hw->lock);
-        double s1p = hw->sum_prime; long n1p = hw->n_prime;
-        double s1g = hw->sum_gold;  long n1g = hw->n_gold;
-        pthread_mutex_unlock(&hw->lock);
+        double s1p, s1g; long n1p, n1g;
+        hwmon_snap_full(hw, &s1p, &n1p, &s1g, &n1g, NULL, NULL, NULL, NULL);
 
-        long nnp = n1p - n0p;
-        long nng = n1g - n0g;
-        res[r].bw_hwmon_prime = (nnp >= 3) ? (s1p - s0p) / (double)nnp : -1.0;
-        res[r].bw_hwmon_gold  = (nng >= 3) ? (s1g - s0g) / (double)nng : -1.0;
+        res[r].bw_hwmon_prime = hwmon_bw_window(s0p, n0p, s1p, n1p, 3);
+        res[r].bw_hwmon_gold  = hwmon_bw_window(s0g, n0g, s1g, n1g, 3);
     }
 
     free(buf);
@@ -408,11 +322,8 @@ int main(void)
     fprintf(stderr, "\n");
 
     /* Step 3: start hardware DRAM monitor background thread */
-    Hwmon hw = { .running = 1,
-                 .sum_prime = 0.0, .n_prime = 0,
-                 .sum_gold  = 0.0, .n_gold  = 0,
-                 .available = 0 };
-    pthread_mutex_init(&hw.lock, NULL);
+    Hwmon hw;
+    hwmon_init(&hw, HWMON_PRIME | HWMON_GOLD);
     pthread_t tid;
     pthread_create(&tid, NULL, hwmon_thread, &hw);
     sleep(1);  /* allow first bw_hwmon_meas samples to arrive */
@@ -526,7 +437,7 @@ int main(void)
     /* Step 7: stop hwmon thread */
     hw.running = 0;
     pthread_join(tid, NULL);
-    pthread_mutex_destroy(&hw.lock);
+    hwmon_destroy(&hw);
 
     /* Step 8: print conclusion */
     print_conclusion(hw.available);

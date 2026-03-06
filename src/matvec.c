@@ -34,10 +34,22 @@
  * Output (stderr) -- human-readable mean+/-stddev table
  */
 
-#include "common.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
 #include <math.h>
 #include <pthread.h>
-#include <arm_neon.h>
+#include "cpu.h"
+#include "timer.h"
+#include "cache.h"
+#include "stats.h"
+#include "hwmon.h"
+#include "pmu.h"
+#include "thermal.h"
+#include "matvec_kernels.h"
 
 /* --------------------------------------------------------------------------
  * Configuration
@@ -47,144 +59,6 @@
 #define MEASURE_SECS    3.0     /* per-rep measurement window (each kernel) */
 #define N_REPS          7       /* independent trials per WS point */
 #define FLUSH_SIZE      (24 * 1024 * 1024)  /* > LLCC (12 MB) */
-#define TRACE_BASE      "/sys/kernel/debug/tracing"
-#define SKIN_ZONE_PATH  "/sys/class/thermal/thermal_zone53/temp"
-
-/* --------------------------------------------------------------------------
- * Hardware DRAM monitor -- identical to bwprobe.c
- * ------------------------------------------------------------------------- */
-typedef struct {
-    volatile int    running;
-    pthread_mutex_t lock;
-    double          sum;
-    long            n;
-    int             available;
-} Hwmon;
-
-static void *hwmon_thread(void *arg)
-{
-    Hwmon *hw = arg;
-
-    int fd = open(TRACE_BASE "/events/dcvs/bw_hwmon_meas/enable", O_WRONLY);
-    if (fd < 0) { hw->available = 0; hw->running = 0; return NULL; }
-    write(fd, "1", 1); close(fd);
-    fd = open(TRACE_BASE "/tracing_on", O_WRONLY);
-    if (fd >= 0) { write(fd, "1", 1); close(fd); }
-
-    hw->available = 1;
-
-    int pfd = open(TRACE_BASE "/trace_pipe", O_RDONLY | O_NONBLOCK);
-    if (pfd < 0) { hw->running = 0; return NULL; }
-
-    char raw[8192], line[512];
-    int lp = 0;
-
-    while (hw->running) {
-        ssize_t n = read(pfd, raw, sizeof(raw));
-        if (n <= 0) { usleep(2000); continue; }
-        for (ssize_t i = 0; i < n; i++) {
-            char c = raw[i];
-            if (c == '\n' || lp == (int)sizeof(line) - 2) {
-                line[lp] = '\0'; lp = 0;
-                if (strstr(line, "bw_hwmon_meas") &&
-                    strstr(line, "bwmon-llcc-prime")) {
-                    char *p = strstr(line, "mbps");
-                    if (p) {
-                        unsigned long long v = 0;
-                        if (sscanf(p, "mbps = %llu", &v) == 1) {
-                            pthread_mutex_lock(&hw->lock);
-                            hw->sum += (double)v;
-                            hw->n++;
-                            pthread_mutex_unlock(&hw->lock);
-                        }
-                    }
-                }
-            } else {
-                line[lp++] = c;
-            }
-        }
-    }
-
-    close(pfd);
-    fd = open(TRACE_BASE "/events/dcvs/bw_hwmon_meas/enable", O_WRONLY);
-    if (fd >= 0) { write(fd, "0", 1); close(fd); }
-    return NULL;
-}
-
-/* --------------------------------------------------------------------------
- * Thermal helper
- * ------------------------------------------------------------------------- */
-static double read_skin_c(void)
-{
-    FILE *f = fopen(SKIN_ZONE_PATH, "r");
-    if (!f) return -1.0;
-    int raw = 0;
-    fscanf(f, "%d", &raw);
-    fclose(f);
-    return raw / 1000.0;
-}
-
-/* --------------------------------------------------------------------------
- * Scalar matvec kernel — autovectorized by compiler (NEON FMLA on AArch64)
- *
- * noinline: prevents the compiler from merging consecutive kernel calls,
- * which would collapse A reads across iterations of the pass loop.
- * restrict: informs the compiler that A, x, y have no aliasing.
- * ------------------------------------------------------------------------- */
-__attribute__((noinline))
-static void matvec_scalar(const float * restrict A,
-                          const float * restrict x,
-                          float       * restrict y,
-                          int M, int N)
-{
-    for (int i = 0; i < M; i++) {
-        const float * restrict row = A + (size_t)i * N;
-        float s = 0.0f;
-        for (int j = 0; j < N; j++)
-            s += row[j] * x[j];
-        y[i] = s;
-    }
-}
-
-/* --------------------------------------------------------------------------
- * NEON matvec kernel — 8 float32x4 accumulators, 32-wide inner unroll
- *
- * Each iteration processes 32 floats (128 bytes = 2 cache lines) from A
- * and x simultaneously.  8 independent accumulators hide FMA latency and
- * keep the load-execute pipeline saturated.
- * ------------------------------------------------------------------------- */
-__attribute__((noinline))
-static void matvec_neon(const float * restrict A,
-                        const float * restrict x,
-                        float       * restrict y,
-                        int M, int N)
-{
-    for (int i = 0; i < M; i++) {
-        const float *row = A + (size_t)i * N;
-        float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
-        float32x4_t acc2 = vdupq_n_f32(0.0f), acc3 = vdupq_n_f32(0.0f);
-        float32x4_t acc4 = vdupq_n_f32(0.0f), acc5 = vdupq_n_f32(0.0f);
-        float32x4_t acc6 = vdupq_n_f32(0.0f), acc7 = vdupq_n_f32(0.0f);
-        int j = 0;
-        for (; j <= N - 32; j += 32) {
-            acc0 = vfmaq_f32(acc0, vld1q_f32(row + j     ), vld1q_f32(x + j     ));
-            acc1 = vfmaq_f32(acc1, vld1q_f32(row + j +  4), vld1q_f32(x + j +  4));
-            acc2 = vfmaq_f32(acc2, vld1q_f32(row + j +  8), vld1q_f32(x + j +  8));
-            acc3 = vfmaq_f32(acc3, vld1q_f32(row + j + 12), vld1q_f32(x + j + 12));
-            acc4 = vfmaq_f32(acc4, vld1q_f32(row + j + 16), vld1q_f32(x + j + 16));
-            acc5 = vfmaq_f32(acc5, vld1q_f32(row + j + 20), vld1q_f32(x + j + 20));
-            acc6 = vfmaq_f32(acc6, vld1q_f32(row + j + 24), vld1q_f32(x + j + 24));
-            acc7 = vfmaq_f32(acc7, vld1q_f32(row + j + 28), vld1q_f32(x + j + 28));
-        }
-        /* Reduce 8 accumulators */
-        acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
-        acc4 = vaddq_f32(vaddq_f32(acc4, acc5), vaddq_f32(acc6, acc7));
-        float s = vaddvq_f32(vaddq_f32(acc0, acc4));
-        /* Scalar tail for N not divisible by 32 */
-        for (; j < N; j++) s += row[j] * x[j];
-        y[i] = s;
-    }
-}
 
 /* --------------------------------------------------------------------------
  * Per-rep result
@@ -235,15 +109,7 @@ static void measure_ws(int ws_mb, int M, int N, Hwmon *hw,
     prefault(y, y_bytes);
 
     /* Open bus_access counter once per WS point */
-    struct perf_event_attr pa;
-    memset(&pa, 0, sizeof(pa));
-    pa.type           = ARMV8_PMU_TYPE;
-    pa.config         = 0x0019;         /* bus_access */
-    pa.size           = sizeof(pa);
-    pa.disabled       = 1;
-    pa.exclude_kernel = 0;              /* mandatory on Oryon V2 */
-    pa.exclude_hv     = 1;
-    int bus_fd = (int)perf_event_open(&pa, 0, -1, -1, 0);
+    int bus_fd = open_bus_access();
     int bus_ok = (bus_fd >= 0);
 
     for (int r = 0; r < N_REPS; r++) {
@@ -256,9 +122,8 @@ static void measure_ws(int ws_mb, int M, int N, Hwmon *hw,
         matvec_scalar(A, x, y, M, N);
 
         /* hwmon snapshot before scalar */
-        pthread_mutex_lock(&hw->lock);
-        double s0 = hw->sum;  long n0 = hw->n;
-        pthread_mutex_unlock(&hw->lock);
+        double s0; long n0;
+        hwmon_snap(hw, &s0, &n0);
 
         /* PMU reset + enable for scalar */
         if (bus_ok) {
@@ -281,12 +146,9 @@ static void measure_ws(int ws_mb, int M, int N, Hwmon *hw,
         }
 
         /* hwmon snapshot after scalar */
-        pthread_mutex_lock(&hw->lock);
-        double s1 = hw->sum;  long n1 = hw->n;
-        pthread_mutex_unlock(&hw->lock);
-
-        long   nn     = n1 - n0;
-        double hw_bw  = (nn >= 3) ? (s1 - s0) / (double)nn : -1.0;
+        double s1; long n1;
+        hwmon_snap(hw, &s1, &n1);
+        double hw_bw = hwmon_bw_window(s0, n0, s1, n1, 3);
         double A_streamed = (double)passes * (double)A_bytes;
 
         res[r].elapsed_s     = elapsed;
@@ -301,9 +163,8 @@ static void measure_ws(int ws_mb, int M, int N, Hwmon *hw,
         matvec_neon(A, x, y, M, N);
 
         /* hwmon snapshot before NEON */
-        pthread_mutex_lock(&hw->lock);
-        double s0n = hw->sum;  long n0n = hw->n;
-        pthread_mutex_unlock(&hw->lock);
+        double s0n; long n0n;
+        hwmon_snap(hw, &s0n, &n0n);
 
         /* PMU reset + enable for NEON */
         if (bus_ok) {
@@ -326,12 +187,9 @@ static void measure_ws(int ws_mb, int M, int N, Hwmon *hw,
         }
 
         /* hwmon snapshot after NEON */
-        pthread_mutex_lock(&hw->lock);
-        double s1n = hw->sum;  long n1n = hw->n;
-        pthread_mutex_unlock(&hw->lock);
-
-        long   nnn      = n1n - n0n;
-        double hw_bwn   = (nnn >= 3) ? (s1n - s0n) / (double)nnn : -1.0;
+        double s1n; long n1n;
+        hwmon_snap(hw, &s1n, &n1n);
+        double hw_bwn = hwmon_bw_window(s0n, n0n, s1n, n1n, 3);
         double A_streamn = (double)passesn * (double)A_bytes;
 
         res[r].elapsed_neon_s     = elapsedn;
@@ -369,8 +227,8 @@ int main(void)
         CPU_PIN, M_ROWS, M_ROWS * 4 / 1024, N_REPS, MEASURE_SECS);
 
     /* Start hwmon background thread */
-    Hwmon hw = { .running = 1, .sum = 0.0, .n = 0, .available = 0 };
-    pthread_mutex_init(&hw.lock, NULL);
+    Hwmon hw;
+    hwmon_init(&hw, HWMON_PRIME);
     pthread_t tid;
     pthread_create(&tid, NULL, hwmon_thread, &hw);
     sleep(1);
@@ -382,12 +240,7 @@ int main(void)
 
     /* Probe bus_access availability */
     {
-        struct perf_event_attr pa;
-        memset(&pa, 0, sizeof(pa));
-        pa.type = ARMV8_PMU_TYPE; pa.config = 0x0019;
-        pa.size = sizeof(pa); pa.disabled = 1;
-        pa.exclude_kernel = 0; pa.exclude_hv = 1;
-        int fd = (int)perf_event_open(&pa, 0, -1, -1, 0);
+        int fd = open_bus_access();
         if (fd >= 0) {
             fprintf(stderr, "[ bus_access (0x0019): AVAILABLE ]\n\n");
             close(fd);
@@ -477,7 +330,7 @@ int main(void)
     /* Stop hwmon thread */
     hw.running = 0;
     pthread_join(tid, NULL);
-    pthread_mutex_destroy(&hw.lock);
+    hwmon_destroy(&hw);
 
     return 0;
 }
