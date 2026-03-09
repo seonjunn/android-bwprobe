@@ -25,7 +25,7 @@ Measurement points in the memory hierarchy:
 
 ```
   L2 (12 MB)
-    ↓ ← bus_access (PMU 0x0019): all L2 misses, reads + writes, fires at WS > 12 MB
+    ↓ ← bus_access (PMU 0x0019): CPU-side traffic leaving L2 toward shared fabric (reads + writes)
   LLCC (~112 MB, absorbs ~30% of L2 misses regardless of WS)
     ↓ ← bwmon (bw_hwmon_meas): DRAM reads only, fires at WS > LLCC
   LPDDR5X DRAM
@@ -35,16 +35,31 @@ Measurement points in the memory hierarchy:
 
 ## Key Findings
 
-**1. Metric regime boundaries.** `bus_access` measures at the L2 boundary (all L2 misses
-entering the shared subsystem), `bwmon` at the DRAM controller. The LLCC sits between them
-and absorbs ~30% of L2 misses:
-- WS ≤ 12 MB (L2-resident): both metrics near zero; no shared-resource pressure
-- 12 MB < WS < LLCC: `bus_access` fires (LLCC contention); `bwmon` ≈ 0
-- WS > LLCC: both fire; `bus_access / bwmon = (reads + writes) / reads`
+**1. Metric regime boundaries.** `bus_access` and `bwmon` are at different hierarchy levels:
+- `bus_access`: CPU-side traffic entering shared subsystem (LLCC/DRAM path)
+- `bwmon`: traffic that reaches DRAM controller (reads only)
 
-**2. `bus_access` is the correct contention metric.** It fires at WS > 12 MB — i.e.,
-whenever traffic enters the shared subsystem (LLCC or DRAM). `bwmon` only fires at
-WS > LLCC, missing LLCC-resident workloads that still compete for shared capacity.
+In data, `bus_access` rises strongly before DRAM saturation points where `bwmon` is still low
+for LLCC-resident behavior (for example, chase WS=64 MB).
+
+**1a. LLCC transparency is determined by temporal reuse, not working-set size.**
+Whether the LLCC absorbs L2 misses (opaque) or passes them through to DRAM
+(transparent) depends on whether the same cache line is reused before eviction:
+- **Temporal reuse (e.g., looping random access):** LLCC absorbs after the first
+  cold miss. bwmon silent even at WS=64 MB. Example DNN: batched FC inference
+  where weights (< 112 MB) are reused across the batch.
+- **No reuse (e.g., single-pass streaming):** LLCC is a transparent staging
+  buffer — every byte still traverses DRAM regardless of WS vs. LLCC capacity.
+  bwmon fires at WS > L2 (> 12 MB). Example DNN: batch=1 FC inference
+  streaming a large weight matrix on every call.
+
+This is why pointer-chase (random, looping, MLP=1, defeats prefetcher) is the
+canonical memory-hierarchy probe: it has temporal reuse so the working set
+stabilizes at exactly one cache level, and MLP=1 ensures measured throughput
+equals `1 / access_latency` at that level.
+
+**2. `bus_access` captures LLCC+DRAM-side pressure for CPU workloads.** `bwmon` only captures
+traffic that reaches DRAM, so it can miss LLCC-resident contention.
 `bus_access` also counts reads AND writes; for AXPY (2 reads + 1 write),
 `bus_access / bwmon = 3/2 = 1.5` — a principled difference, not error.
 
@@ -52,38 +67,82 @@ WS > LLCC, missing LLCC-resident workloads that still compete for shared capacit
 for all workloads at WS = 16–256 MB. This is temporal reuse within the workload, not just
 WS fitting in LLCC: even at WS = 256 MB > LLCC = 112 MB, 30% of L2 misses hit in LLCC.
 
-**4. ICC metrics are at different hierarchy levels.** `icc_llcc_agg` = total L2 miss bandwidth
-(all traffic entering LLCC). `icc_dram_agg` = LLCC miss bandwidth (going to DRAM). They are
-sequential hops: `icc_dram = 0.70 × icc_llcc`. Adding them double-counts. Verified:
-at WS=16 MB (LLCC-resident) for neon_matvec, `icc_llcc / bw_alg = 1.007`.
+**4. The correct contention boundary is L2→LLCC, not LLCC→DRAM.**
+L2 is private to the Prime cluster; traffic absorbed within L2 causes zero cross-processor
+contention. The shared subsystem begins at the L2 output port. `bus_access` and `icc_llcc_agg`
+both sit at this boundary. `icc_dram_agg` is at the wrong boundary (LLCC→DRAM): it
+structurally misses LLCC-resident pressure regardless of precision or cadence.
 
-**5. HW prefetcher amplifies by ~1.9×.** `bwmon / bw_alg ≈ 1.9×` for all streaming workloads
-(LPDDR5X 128B burst per 64B miss). For AXPY: `bwmon / bw_alg = 1.9 × 2/3 = 1.25` (bw_alg
-counts 3 streams; prefetcher amplifies the 2 demand reads). `bus_access / bw_alg ≈ 1.93×`
-for all streaming workloads (reads and writes amplified equally by the prefetcher).
+**5. bus_access and icc_llcc_agg measure the same physical traffic at the same boundary.**
+`icc_llcc_agg ≈ Σ bus_access (all processes, all CPU clusters)`.
+`bus_access` is the per-process, workload-isolated version; `icc_llcc_agg` is the all-CPU
+system-level version. They differ in scope (per-process vs. cluster) and precision (~4 ms
+hardware counter vs. ~40 ms DCVS EMA). For workload characterization, `bus_access` is
+preferred (no background contamination, stable across runs). For system-level monitoring,
+`icc_llcc_agg` is the available software proxy.
 
-**6. ICC undercounts DRAM by 10–52%.** DCVS votes every 40 ms via EMA. Model:
-`icc_dram = 0.81 × bwmon + 1,057 MB/s` (R²=0.978). Background floor (β=1,057 MB/s from
-display/audio/DSP) causes ICC to *overcount* when `bwmon < 5,615 MB/s`. Undercount is worst
-for high-bandwidth write workloads (neon_axpy: 52% undercount vs total DRAM traffic).
+**6. ICC sequential hops: `icc_dram = 0.70 × icc_llcc`.** They are not parallel paths.
+Adding them double-counts. Verified: neon_matvec WS=16 MB (LLCC-resident), `icc_llcc / bw_alg = 1.007`.
+
+**7. HW prefetcher amplifies by ~1.9×.** `bus_access / bw_alg ≈ 1.93×` for all streaming
+workloads. This is valid for contention characterization: prefetcher fetches compete for LLCC
+bandwidth as much as demand fetches. Note when comparing against algorithmic throughput.
+
+**8. icc_dram undercounts DRAM by 10–52%.** DCVS EMA (40 ms). Model:
+`icc_dram = 0.81 × bwmon + 1,057 MB/s` (R²=0.978). Retained only for DDR DCVS analysis,
+not for contention characterization.
 
 ---
 
 ## Metric Selection
 
-| Goal | Metric | Condition |
-|---|---|---|
-| **Shared-subsystem contention (universal)** | `bus_access` | WS > 12 MB; reads + writes; covers LLCC and DRAM |
-| DRAM read bandwidth (ground truth) | `bwmon` | WS > 112 MB only; misses LLCC-resident pressure |
-| Demand throughput (any WS) | `bw_alg` | Always; algorithm rate, independent of cache hierarchy |
-| Real-time DRAM monitoring | `icc_dram_agg` | WS > LLCC; ~10–25% undercount; read+write |
-| Total CPU→LLCC demand | `icc_llcc_agg` | WS > 12 MB; ≈ `bus_access`; includes LLCC hits |
+### CPU contention characterization
 
-At DRAM regime: `bus_access = 1.93 × bw_alg` (streaming) and
-`bus_access = bwmon × (1 + write_streams / read_streams)`.
+| Metric | Precision | Background | Use when |
+|---|---|---|---|
+| `bus_access` | High (~4 ms, per-process) | Excluded | Characterizing a specific kernel's intrinsic memory intensity |
+| `icc_llcc_agg` | Lower (~40 ms DCVS EMA) | Included (all CPU clusters) | System-level CPU memory monitoring; per-process PMU unavailable |
 
-`bwmon` is insufficient for contention estimation: a workload with WS = 64 MB causes
-significant LLCC pressure (`bus_access` fires) but shows `bwmon ≈ 0`.
+Both are at the correct boundary (L2→LLCC). `icc_dram_agg` is at the wrong
+boundary and should not be used for contention characterization.
+
+At DRAM regime: `bus_access = 1.93 × bw_alg` (streaming);
+`bus_access / bwmon = 1 + write_streams/read_streams` (e.g. 1.56 for AXPY).
+
+**Robustness across workload regimes.** This selection holds whether workloads
+are LLCC-resident or streaming-transparent. In the streaming regime (matvec,
+matmul — LLCC transparent), `bwmon` becomes a valid read-only corroboration and
+`icc_dram_agg` loses its boundary objection, but neither displaces the two
+candidates: `bus_access` still counts writes and is per-process; `icc_llcc_agg`
+was already at the correct boundary. In the LLCC-resident regime (looping random
+access), `bwmon` and `icc_dram_agg` are blind. The metric ranking is stable
+across the full workload space.
+
+### Other metrics
+
+| Goal | Metric |
+|---|---|
+| DRAM read bandwidth ground truth | `bwmon` (WS > 112 MB only) |
+| Algorithmic demand throughput | `bw_alg` |
+| System-level DRAM demand / DDR DCVS | `icc_dram_agg` |
+
+### Cross-processor (CPU + GPU + NPU)
+
+No single metric covers all processors. GPU compute bypasses ICC (GMU path) and
+is not in `icc_llcc_agg` or `icc_dram_agg`. A complete picture requires
+`bus_access` (CPU workload) + kgsl GMU counters (GPU) combined at the DRAM
+boundary.
+
+## Source Grounding Notes
+
+- LLCC size (~112 MB): derived from Exp4 flush-size sweep (`llcc_size.c`, 24/128/256 MB flush)
+  and documented results in this repo.
+- "`bus_access` at L2 boundary": based on PMU event semantics used in code/docs and supported
+  by observed regime behavior (`bus_access` reacts before DRAM-only metric `bwmon`).
+- `avg_bw` vs `agg_avg` (ICC):
+  - `avg_bw` is one DCVS client vote (partial).
+  - `agg_avg` is aggregate across all active ICC clients at that node (total node demand).
+  - Therefore this project uses `agg_avg` for system-level comparison.
 
 ---
 

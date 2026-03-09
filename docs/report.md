@@ -15,8 +15,11 @@ CPU core (cpu6, Prime cluster)
   LPDDR5X DRAM (128-bit bus)
 ```
 
-`bus_access` and `bwmon` measure at **different hierarchy levels**. The LLCC sits
-between them, absorbing ~30% of all L2 misses before they reach DRAM.
+`bus_access` and `bwmon` measure at **different hierarchy levels**:
+- `bus_access`: CPU-side traffic entering the shared subsystem (LLCC/DRAM path)
+- `bwmon`: traffic that reaches DRAM controller (reads only)
+
+The LLCC sits between them, absorbing ~30% of all L2 misses before they reach DRAM.
 
 The contention target is the **entire shared memory subsystem** (LLCC + DRAM), not DRAM
 alone. All processors (CPU clusters, GPU, DSP, display) share both the LLCC and the DRAM
@@ -28,7 +31,7 @@ fires) even though bwmon ≈ 0. `bus_access` captures this; `bwmon` does not.
 | Metric | What it measures | Regime | Read/Write |
 |---|---|---|---|
 | `bwmon` (bw_hwmon_meas) | DRAM controller read bandwidth | WS > LLCC (~112 MB) | reads only |
-| `bus_access` (PMU 0x0019) | L2 miss bandwidth (→ LLCC or DRAM) | WS > L2 (~12 MB) | reads + writes |
+| `bus_access` (PMU 0x0019) | CPU-side traffic toward LLCC/DRAM | CPU working sets beyond L2 residency | reads + writes |
 | `icc_llcc_agg` | DCVS vote: total CPU→LLCC demand | WS > L2 | reads + writes |
 | `icc_dram_agg` | DCVS vote: LLCC→DRAM demand | WS > LLCC | reads + writes |
 | `bw_alg` | Demand traffic / elapsed (computed) | any WS | demand only |
@@ -53,8 +56,11 @@ Filter by destination only to avoid double-counting:
 | `path=llcc_mc-ebi` + `node=ebi` | `icc_dram_agg` |
 
 Two fields per event (kBps):
-- `avg_bw` — one DCVS client's vote (partial; ignore)
-- `agg_avg` — aggregate across ALL ICC clients at that node (use this)
+- `avg_bw` — one DCVS client's vote (partial view)
+- `agg_avg` — aggregate across all active ICC clients at that node (total node demand)
+
+DCVS client here means a bandwidth-voting requester on the interconnect path
+(for example CPU path, display, DSP, video, storage).
 
 **Relationship between icc_llcc and icc_dram:**
 ```
@@ -107,10 +113,9 @@ For workloads with writes, this ratio exceeds 1:
 | neon_matvec | 1.061 | ~1.0 | A is read-only streaming |
 | neon_axpy | **1.560** | **3/2 = 1.5** | 2 reads (x, y) + 1 write (y) |
 
-This is not a calibration error. For shared-subsystem contention estimation, use
-`bus_access`: it captures total traffic entering the shared subsystem (reads + writes),
-fires at WS > L2 (covering LLCC-resident workloads), and equals bwmon × (reads+writes)/reads
-in the DRAM regime. `bwmon` (reads only, DRAM regime only) is insufficient for this purpose.
+This is not a calibration error. For CPU workloads, `bus_access` captures total traffic
+entering the shared subsystem (reads + writes), while `bwmon` captures DRAM reads only.
+In the DRAM regime, `bus_access ≈ bwmon × (reads+writes)/reads`.
 
 ---
 
@@ -292,3 +297,21 @@ Oryon V2. `exclude_kernel=1` causes 23–33× undercounting for `bus_access`.
 | `1d84000.ufshc` | UFS storage |
 
 Background floor β ≈ 1,057 MB/s in icc_dram_agg from non-CPU clients above.
+
+---
+
+## 11. Claim Provenance (Data vs Semantics)
+
+This section clarifies where key statements come from.
+
+- LLCC effective size around 112 MB:
+  - Source type: experiment result in this repo (Exp4), based on flush-size sweep.
+  - Evidence path: `llcc_size.c` method + report tables/summary text.
+- "`bus_access` measures at L2 boundary":
+  - Source type: PMU event semantics (documentation/code comments) plus data consistency.
+  - Data consistency: `bus_access` responds in LLCC-resident regimes where DRAM monitor
+    `bwmon` can stay near background, indicating it is upstream of DRAM.
+- "`agg_avg` over `avg_bw`":
+  - Source type: tracepoint field meaning + implementation choice.
+  - Reason: `avg_bw` is per-client partial vote; `agg_avg` is node aggregate used for
+    total-demand comparisons.
