@@ -1,12 +1,14 @@
 # Memory Bandwidth Measurement — SM8750 (Snapdragon 8 Elite)
 
-Overview of the hardware memory subsystem and the three available measurement
-mechanisms on the Samsung Galaxy S25+ (Oryon V2, Android 15, kernel 6.6).
-Detailed mechanism documentation is in the companion files:
+Overview of the hardware memory subsystem and the four available measurement metrics
+on the Samsung Galaxy S25+ (Oryon V2, Android 15, kernel 6.6).
 
-- `docs/pmu.md` — ARMv8 PMU and the `bus_access` event (0x0019)
-- `docs/hwmon.md` — Qualcomm `bw_hwmon` hardware monitor and `bw_hwmon_meas` tracepoint
-- `docs/icc.md` — Linux ICC framework, DCVS, and the `icc_set_bw` tracepoint
+**Start here** after reading the [README](../README.md). Covers hierarchy, all four
+metrics, regime behavior, and a metric selection guide. Mechanism deep dives are in:
+
+- [`pmu.md`](pmu.md) — ARMv8 PMU and the `bus_access` event (0x0019)
+- [`hwmon.md`](hwmon.md) — Qualcomm `bw_hwmon` hardware monitor and `bw_hwmon_meas` tracepoint
+- [`icc.md`](icc.md) — Linux ICC framework, DCVS, and the `icc_set_bw` tracepoint
 
 ---
 
