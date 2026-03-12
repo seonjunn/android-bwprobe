@@ -26,12 +26,12 @@ CPU core (cpu6, Prime cluster, Oryon V2)
 
 Cache parameters:
 
-| Level | Size | Scope | Latency |
-|---|---|---|---|
-| L1D | 96 KB | Per-core | < 1 ns |
-| L2 | 12 MB | Prime cluster (cpu6–7) | ~1 ns |
-| LLCC | ~112 MB | All clusters + I/O masters | ~2.7 ns |
-| DRAM | — | Global | ~5.5 ns |
+| Level | Size | Scope | Latency | Peak BW |
+|---|---|---|---|---|
+| L1D | 96 KB | Per-core | < 1 ns | — |
+| L2 | 12 MB | Prime cluster (cpu6–7) | ~1 ns | — |
+| LLCC | ~112 MB | All clusters + I/O masters | ~2.7 ns | — |
+| DRAM | — | Global | ~5.5 ns | ~85 GB/s (reads; Qualcomm product brief) |
 
 The LLCC is the central shared resource. Contention for LLCC and DRAM bandwidth
 is what matters for system-level performance interference. Any L2 miss (WS > 12
@@ -165,12 +165,16 @@ icc_llcc_agg updated  (SoC-wide aggregate via DCVS vote; GPU excluded)
 | Background | Excluded | Included (all active ICC clients) |
 | Precision | High (hardware counter, ~4 ms) | Lower (DCVS EMA, ~40 ms, amplitude sensitivity at low BW) |
 
-**Prefetcher note:** Both metrics include hardware prefetcher traffic
-(bus_access counts it directly; icc_llcc_agg reflects it through the DCVS
-vote). This is correct for contention characterization — prefetcher fetches
-compete for LLCC bandwidth just as demand fetches do. The amplification
-(`bus_access / bw_alg ≈ 1.9×` for streaming) should be noted when comparing
-against algorithmic throughput, but it is not a measurement artifact.
+**Burst amplification note:** `bus_access / bw_alg ≈ 2.0×` for streaming
+workloads (bwmon / bw_alg ≈ 1.88×). This is not a measurement artifact but a
+hardware effect: LPDDR5X has a 128B minimum burst (BL16 × 8 bytes), so every
+64B L2 miss returns 128B from DRAM. Because WS (128 MB) far exceeds L2 (12 MB),
+the adjacent 64B line from the burst is evicted from L2 before use — wasted.
+Each 128B burst also generates two 64B `BUS_ACCESS` events (one per cache line
+crossing the L2 boundary), keeping bus_access ≈ bwmon for read-only workloads.
+The 6% excess of bus_access over bwmon is write-back traffic (dirty evictions)
+that bwmon does not count. This amplification is real bandwidth consumed in the
+shared subsystem and is correctly included in contention characterization.
 
 ### 4.2 bus_access vs. bwmon — Different Boundaries
 
@@ -266,10 +270,72 @@ No single metric covers all processors. On SM8750:
 | `bus_access` | 1.052 ± 0.055 | [1.032, 1.073] | 0.9997 |
 | `icc_dram_agg` | 0.924 ± 0.107 | [0.885, 0.963] | 0.9966 |
 
-### Hardware prefetcher amplification
+### Spatial burst amplification (LPDDR5X BL16)
 
 ```
-bwmon / bw_alg ≈ 1.90×   (scalar_matvec, neon_matvec — read-only streaming)
-bwmon / bw_alg ≈ 1.25×   (neon_axpy — only 2 of 3 streams reach DRAM)
-bus_access / bw_alg ≈ 1.90×   (consistent across all streaming workloads)
+bwmon      / bw_alg ≈ 1.88×   (scalar_matvec, neon_matvec — read-only streaming)
+bwmon      / bw_alg ≈ 1.25×   (neon_axpy — bwmon sees only 2 of 3 streams)
+bus_access / bw_alg ≈ 2.0×    (read-only streaming; two 64B events per 128B burst)
+bus_access / bwmon  ≈ 1.06×   (read-only; 6% from dirty write-backs)
 ```
+
+Source: LPDDR5X BL16 minimum burst (128B) + L2 thrashing at WS/L2 ≈ 10.7×.
+See `pmu.md` §3.7 for derivation.
+
+---
+
+## 7. Hardware Specifications and Sources
+
+### SM8750 confirmed specs
+
+| Component | Spec | Source |
+|---|---|---|
+| DRAM type | LPDDR5X | Qualcomm SM8750-3-AB Product Brief |
+| DRAM bus width | 64-bit (8 bytes) | Qualcomm SM8750-3-AB Product Brief |
+| DRAM peak bandwidth | **85.33 GB/s** | Qualcomm SM8750-3-AB Product Brief |
+| DRAM speed | ~10,667 MT/s (~5,333 MHz) | Derived: 85.33 GB/s ÷ 8 bytes |
+| L2 cache (Prime cluster) | 12 MB shared, cpu6–7 | Qualcomm / AnandTech |
+| LLCC capacity | ~112 MB | Measured: latency jump at WS ≈ 112 MB |
+| CPU frequency (locked) | 4,473,600 kHz | `/data/local/tmp/powerctl.sh` on device |
+
+### LPDDR5X burst geometry
+
+LPDDR5X uses Burst Length 16 (BL16). Each device has a 16-bit data width.
+For a 64-bit channel (4 devices in parallel):
+
+```
+minimum burst = BL16 × channel_width = 16 transfers × 8 bytes = 128 bytes
+```
+
+Every DRAM access — demand or prefetch — transfers exactly 128B regardless of
+how many bytes the CPU actually requested. This is the physical source of the
+1.88× bwmon/bw_alg amplification for streaming workloads at WS >> L2.
+
+### bwmon `mbps` field unit
+
+The `mbps` field in the `dcvs/bw_hwmon_meas` tracepoint is in **megabytes per
+second** (MB/s), despite the "bps" suffix. Confirmed from the Qualcomm kernel
+driver source:
+
+```c
+// drivers/devfreq/governor_bw_hwmon.c
+mbps = bytes_to_mbps(hwmon->get_bytes_and_clear(hwmon), us);
+trace_bw_hwmon_meas(dev_name, mbps, us, wake);
+```
+
+`get_bytes_and_clear()` reads a hardware byte counter and resets it.
+`bytes_to_mbps()` divides by the elapsed microseconds to produce MB/s.
+
+### References
+
+- Qualcomm Snapdragon 8 Elite SM8750-3-AB Product Brief:
+  <https://www.qualcomm.com/content/dam/qcomm-martech/dm-assets/documents/Snapdragon-8-Elite-SM8750-3-AB-Product-Brief.pdf>
+- PhoneDB SM8750-AC detailed specs:
+  <https://phonedb.net/index.php?m=processor&id=1027&c=qualcomm_snapdragon_8_elite_sm8750-ac___sun&d=detailed_specs>
+- JEDEC LPDDR5/5X specification (JESD209-5C):
+  <https://www.jedec.org/sites/default/files/docs/JESD209-5C.pdf>
+- LPDDR5 physical structure / BL16 explanation:
+  <https://www.systemverilog.io/design/lpddr5-tutorial-physical-structure/>
+- Qualcomm `governor_bw_hwmon.c` kernel driver (Facebook Portal kernel mirror):
+  <https://github.com/facebookincubator/Portal-Kernel/blob/master/drivers/devfreq/governor_bw_hwmon.c>
+- ARM Architecture Reference Manual for Armv8-A, Chapter D7 (PMU event 0x0019 BUS_ACCESS)

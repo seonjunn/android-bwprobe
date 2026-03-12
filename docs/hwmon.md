@@ -327,20 +327,44 @@ If bwmon counted writes, the ratio would be lower. The 3/2 ratio (3 algorithmic
 streams vs. 2 measured DRAM reads) is consistent across all reps with very low
 variance (CV = 0.2% for neon_axpy at WS=128 MB).
 
-### 3.4 Hardware Prefetcher Amplification
+### 3.4 Spatial Burst Amplification
 
 Expected: bwmon should equal algorithmic bandwidth (bw_alg). Observed:
 
 ```
-bwmon / bw_alg ≈ 1.90×   (scalar_matvec, neon_matvec — read-only streaming)
-bwmon / bw_alg ≈ 1.25×   (neon_axpy — 2 of 3 streams are DRAM reads, amplified by 1.90×)
+bwmon / bw_alg ≈ 1.88×   (scalar_matvec, neon_matvec — read-only streaming)
+bwmon / bw_alg ≈ 1.25×   (neon_axpy — only 2 of 3 streams are DRAM reads)
 ```
 
-The 1.90× amplification comes from the hardware stream prefetcher issuing
-128 B LPDDR5X bursts per 64 B demand miss, plus additional prefetch-ahead
-requests. The factor is stable across WS ≥ 128 MB for streaming patterns.
-`MADV_RANDOM` (via `madvise`) has no measurable effect on the amplification,
-confirming it is driven by the hardware prefetcher, not the OS page prefetcher.
+**Root cause: LPDDR5X minimum burst size (BL16 = 128B) combined with L2 thrashing.**
+
+LPDDR5X specifies a minimum burst length of BL16 (Burst Length 16). With
+SM8750's 64-bit bus: `BL16 × 8 bytes = 128 bytes per DRAM access`. Every
+LLCC miss fetches 128B — the demanded 64B cache line plus the spatially
+adjacent 64B line — regardless of demand size.
+
+At WS = 128 MB with L2 = 12 MB, L2 thrashes at 10.7× capacity. The "bonus"
+64B line from the burst arrives in L2 but is evicted before use. Result:
+128B of DRAM traffic per 64B of useful demand → bwmon ≈ 2 × bw_alg in
+theory, 1.88× in practice (partial spatial reuse reduces waste slightly).
+
+For AXPY: bwmon counts only reads (2 streams: x, y_read). Each read stream
+is amplified by 1.88×:
+
+```
+bwmon / bw_alg = 1.88 × (2 read streams / 3 total streams) = 1.25×
+```
+
+`MADV_RANDOM` (via `madvise`) has no measurable effect on the factor,
+confirming it is driven by the hardware DRAM burst, not the OS page prefetcher.
+The factor is stable across WS ≥ 128 MB for all streaming patterns.
+
+**Note on bwmon exceeding theoretical DRAM peak:** The SM8750 DRAM peak is
+~85 GB/s (Qualcomm product brief: 85.33 GB/s). The neon_matvec bwmon reading
+(~100 GB/s) exceeds this. The discrepancy is unresolved: bwmon may capture
+additional write traffic not documented in the "reads only" characterization,
+or the actual achievable bandwidth under prefetcher-saturated streaming differs
+from the rated peak. See `docs/pmu.md` §3.7 for discussion.
 
 ### 3.5 Cluster-Level Scope: Background Floor Matters
 
@@ -392,3 +416,24 @@ icc_dram_agg = 0.863 × bwmon + 525     (R²=0.9932)
 `bus_access` tracks bwmon with near-unity correlation. `icc_dram_agg` shows
 systematic undercounting (~8%) relative to bwmon due to DCVS smoothing and
 the ~40 ms vote lag (see `docs/icc.md` §3.3 for the full ICC undercounting model).
+
+---
+
+## References
+
+- **Qualcomm SM8750-3-AB Product Brief** — DRAM peak bandwidth 85.33 GB/s
+  (64-bit LPDDR5X bus):
+  <https://www.qualcomm.com/content/dam/qcomm-martech/dm-assets/documents/Snapdragon-8-Elite-SM8750-3-AB-Product-Brief.pdf>
+
+- **PhoneDB SM8750-AC detailed specs** (corroborates 85.33 GB/s):
+  <https://phonedb.net/index.php?m=processor&id=1027&c=qualcomm_snapdragon_8_elite_sm8750-ac___sun&d=detailed_specs>
+
+- **Qualcomm `governor_bw_hwmon.c` kernel driver** — confirms `mbps` field is
+  MB/s, computed as `bytes_to_mbps(get_bytes_and_clear(hwmon), us)`:
+  - Facebook Portal kernel mirror:
+    <https://github.com/facebookincubator/Portal-Kernel/blob/master/drivers/devfreq/governor_bw_hwmon.c>
+  - Android/MSM kernel (older, same pattern):
+    <https://android.googlesource.com/kernel/msm/+/android-7.1.0_r0.2/drivers/devfreq/governor_bw_hwmon.c>
+
+- **JEDEC LPDDR5/5X specification (JESD209-5C)** — BL16 burst geometry:
+  <https://www.jedec.org/sites/default/files/docs/JESD209-5C.pdf>

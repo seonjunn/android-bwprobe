@@ -328,22 +328,81 @@ At LLCC-resident WS (e.g., chase WS=64 MB):
 `bus_access` isolates workload pressure from background at moderate bandwidth
 levels. bwmon cannot make this distinction — it is cluster-level.
 
-### 3.7 Hardware Prefetcher Amplification
+### 3.7 Spatial Burst Amplification
 
-For streaming read workloads, measured at WS=128 MB:
+For read-only streaming workloads at WS=128 MB:
 ```
-bus_access / bw_alg ≈ 1.9×   (scalar_matvec, neon_matvec)
+bwmon      / bw_alg ≈ 1.88×   (scalar_matvec, neon_matvec)
+bus_access / bw_alg ≈ 2.0×    (same workloads)
+bus_access / bwmon  ≈ 1.06×   (same workloads — write-back overhead only)
 ```
 
-The amplification comes from the hardware stream prefetcher issuing additional
-L2 misses beyond the demand footprint. It is consistent across workloads and
-WS once firmly in the DRAM regime.
+**Root cause: LPDDR5X minimum burst size combined with L2 thrashing.**
 
-For AXPY (`bw_alg` counts 3 streams: x, y_read, y_write):
-- bwmon counts 2 DRAM read streams, amplified by 1.9×: `1.9 × 2 = 3.8 streams`.
-- `bus_access` counts all 3 streams plus prefetcher: `≈ 1.9 × 3 = 5.7 streams`.
-- Ratio: `bus_access / bw_alg ≈ 5.7/3 ≈ 1.9×` (consistent with read-only).
-- Ratio: `bwmon / bw_alg ≈ 3.8/3 = 1.27×` (matches empirical 1.25×).
+LPDDR5X specifies a minimum burst length of BL16. With the 64-bit bus on SM8750:
+
+```
+BL16 × 8 bytes = 128 bytes per DRAM access (minimum)
+```
+
+Every L2 miss that reaches DRAM returns 128 bytes — the demanded 64B line plus
+the spatially adjacent 64B line. This is a hardware constraint, not a software
+choice. For a streaming workload with WS=128 MB and L2=12 MB:
+
+```
+WS / L2 ≈ 10.7×  →  L2 continuously thrashes
+```
+
+The adjacent 64B line from the 128B burst fills into L2 but is evicted before
+the CPU demands it, because the streaming pattern fills L2 at 10.7× its
+capacity. Every 64B of algorithmic demand therefore generates a 128B DRAM
+transfer — 64B used, 64B wasted.
+
+```
+bwmon / bw_alg ≈ 128B / 64B = 2.0×  (ideal, zero reuse)
+               = 1.88×               (empirical — occasional spatial reuse
+                                       occurs before L2 eviction)
+```
+
+**Why bus_access/bw_alg ≈ 2.0× (two events per burst):**
+
+`BUS_ACCESS` fires once per 64B transaction crossing the L2 boundary (the
+coherency granule is one cache line). When the 128B DRAM burst deposits two
+64B lines at the L2 input port, two `BUS_ACCESS` events fire:
+
+```
+bus_access = 2 events × 64B = 128B per burst ≈ bwmon_bytes
+
+bus_access / bwmon  ≈ (2×64B) / 128B = 1.0  + write-backs ≈ 1.06
+bus_access / bw_alg = (bus_access / bwmon) × (bwmon / bw_alg) = 1.06 × 1.88 ≈ 2.0×
+```
+
+The 6% excess of `bus_access` over bwmon comes from dirty write-backs (the
+y-vector and stack dirty lines evicted from L2 to LLCC), which `bus_access`
+counts as write transactions but bwmon (reads only) does not.
+
+**Why the stream prefetcher does not explain the amplification:**
+
+A software or hardware prefetcher that shifts demand-fetches earlier in time
+does not amplify traffic — the same N lines are fetched, just sooner. The
+amplification here comes from DRAM burst granularity (128B) exceeding the cache
+line size (64B), with L2 thrashing preventing reuse of the extra bytes. The
+prefetcher's role is to hide latency (keeping the demand pipeline full), not to
+increase total byte count.
+
+**AXPY (2 reads + 1 write per element):**
+
+bwmon sees only reads (x and y_read), each amplified by the 1.88× burst factor:
+
+```
+bwmon / bw_alg = 1.88 × (2 read streams / 3 total streams) = 1.25×
+```
+
+bus_access includes all L2 boundary traffic (reads + write-backs of dirty y):
+
+```
+bus_access / bwmon = 1.56   (≈ 3/2: 3 traffic streams vs. 2 read streams)
+```
 
 ### 3.8 Trace File Schema
 
@@ -359,3 +418,27 @@ t_s,bus_access_MBs
 - `bus_access_MBs`: Instantaneous bandwidth over the last 4 ms interval.
 
 One row per poll; ~250 rows per second. No locking needed (sole writer).
+
+---
+
+## References
+
+- **ARM Architecture Reference Manual for Armv8-A, Chapter D7** — PMU event
+  definitions including BUS_ACCESS (0x0019): "Attributable Memory-read or
+  Memory-write operation that causes a transfer on the outer bus of the PE."
+  Attribution to EL0 vs. EL1 is implementation-defined.
+
+- **JEDEC LPDDR5/5X specification (JESD209-5C)**:
+  <https://www.jedec.org/sites/default/files/docs/JESD209-5C.pdf>
+  BL16 burst length; 16-bit device width; 128B minimum burst on a 64-bit
+  channel (4 devices × 16 bits × 16 transfers = 1024 bits = 128 bytes).
+
+- **LPDDR5 physical structure (systemverilog.io)**:
+  <https://www.systemverilog.io/design/lpddr5-tutorial-physical-structure/>
+  Accessible BL16 walkthrough with diagrams.
+
+- **Qualcomm SM8750-3-AB Product Brief** — DRAM peak bandwidth 85.33 GB/s:
+  <https://www.qualcomm.com/content/dam/qcomm-martech/dm-assets/documents/Snapdragon-8-Elite-SM8750-3-AB-Product-Brief.pdf>
+
+- **PhoneDB SM8750-AC detailed specs** (corroborates 85.33 GB/s):
+  <https://phonedb.net/index.php?m=processor&id=1027&c=qualcomm_snapdragon_8_elite_sm8750-ac___sun&d=detailed_specs>
