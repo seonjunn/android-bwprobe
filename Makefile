@@ -10,9 +10,9 @@ BUILD   := build
 
 HEADERS := $(wildcard src/*.h)
 
-.PHONY: all clean runprobe runmatvec runprefault runllcc runicc runbench pulldata
+.PHONY: all clean runprobe runmatvec runprefault runllcc runicc runbench runburst pulldata
 
-all: $(BUILD)/bwprobe $(BUILD)/matvec $(BUILD)/prefault_exp $(BUILD)/llcc_size $(BUILD)/icc_bw $(BUILD)/bw_bench
+all: $(BUILD)/bwprobe $(BUILD)/matvec $(BUILD)/prefault_exp $(BUILD)/llcc_size $(BUILD)/icc_bw $(BUILD)/bw_bench $(BUILD)/burst_sweep
 
 $(BUILD)/%: src/%.c $(HEADERS) | $(BUILD)
 	$(CC) $(CFLAGS) $< -o $@ -lm
@@ -71,6 +71,13 @@ runbench: $(BUILD)/bw_bench | data
 	-$(ADB) pull $(DESTDIR)/bw_bench_trace_icc.csv         data/bw_bench_trace_icc.csv
 	-$(ADB) pull $(DESTDIR)/bw_bench_trace_bus.csv         data/bw_bench_trace_bus.csv
 	-$(ADB) pull $(DESTDIR)/bw_bench_context.csv           data/bw_bench_context.csv
+
+runburst: $(BUILD)/burst_sweep | data
+	$(ADB) push $< $(DESTDIR)/burst_sweep
+	$(ADB) shell chmod +x $(DESTDIR)/burst_sweep
+	$(ADB) shell "$(DESTDIR)/burst_sweep > /tmp/burst_sweep.csv 2>/tmp/burst_sweep.log"
+	@echo "--- Log ---" && $(ADB) shell cat /tmp/burst_sweep.log
+	$(ADB) pull /tmp/burst_sweep.csv data/burst_sweep.csv
 
 pulldata: | data
 	-$(ADB) pull /tmp/bwprobe.csv       data/bwprobe_summary.csv

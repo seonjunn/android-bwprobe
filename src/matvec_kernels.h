@@ -3,7 +3,7 @@
  *
  * Kernel: y = A x,  A: MxN float32 row-major, x: N float32, y: M float32.
  *
- * Shared by matvec.c, prefault_exp.c, icc_bw.c, bw_bench.c.
+ * Shared by matvec.c, prefault_exp.c, icc_bw.c, bw_bench.c, burst_sweep.c.
  * All functions are marked __attribute__((noinline, unused)) to prevent:
  *   - compiler merging across call sites (noinline)
  *   - warnings in translation units that include only one of the two (unused)
@@ -11,6 +11,7 @@
 
 #pragma once
 #include <arm_neon.h>
+#include "timer.h"    /* now_s() — needed by store_neon() */
 
 /*
  * Scalar kernel — autovectorized by clang into 4-wide NEON FMLA, 1 accumulator.
@@ -96,4 +97,42 @@ static void axpy_neon(float alpha, const float * restrict x, float * restrict y,
         vst1q_f32(y + i + 12, y3);
     }
     for (; i < N; i++) y[i] += alpha * x[i];
+}
+
+/*
+ * NEON non-temporal store stream — bypasses all cache levels (non-temporal hint).
+ * Uses stnp (Store Non-Temporal Pair, A64 §C7.2.320) for 32B writes per instruction.
+ * No write-allocate reads: produces write-only traffic without demand loads.
+ *
+ * 8 stnp per inner iteration = 256B per loop step.  n must be a multiple of 64
+ * (256B / sizeof(float)); caller should round down: n &= ~63UL.
+ *
+ * Returns total passes completed; bw_alg = passes * n * sizeof(float) / elapsed.
+ */
+__attribute__((noinline, unused))
+static long store_neon(float *buf, size_t n, double secs)
+{
+    float32x4_t v   = vdupq_n_f32(1.5f);   /* stored value — irrelevant to BW */
+    float       *end = buf + (n & ~(size_t)63); /* round down to 256B boundary */
+    long passes = 0;
+    double t0 = now_s();
+    while (now_s() - t0 < secs) {
+        float *p = buf;
+        while (p < end) {
+            asm volatile(
+                "stnp %q[v], %q[v], [%[p]]\n\t"
+                "stnp %q[v], %q[v], [%[p], #32]\n\t"
+                "stnp %q[v], %q[v], [%[p], #64]\n\t"
+                "stnp %q[v], %q[v], [%[p], #96]\n\t"
+                "stnp %q[v], %q[v], [%[p], #128]\n\t"
+                "stnp %q[v], %q[v], [%[p], #160]\n\t"
+                "stnp %q[v], %q[v], [%[p], #192]\n\t"
+                "stnp %q[v], %q[v], [%[p], #224]\n\t"
+                : : [p] "r"(p), [v] "w"(v) : "memory"
+            );
+            p += 64;   /* 64 floats = 256 bytes */
+        }
+        passes++;
+    }
+    return passes;
 }
